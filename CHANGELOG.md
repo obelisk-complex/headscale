@@ -146,6 +146,19 @@ removed on this schedule:
 
 - Fix nodes with `tags='null'` losing their assigned user on upgrade [#3325](https://github.com/juanfont/headscale/pull/3325)
 
+### Tailscale Serve HTTPS certificates
+
+Headscale can now advertise per-node certificate domains and handle the
+`/machine/set-dns` endpoint used by `tailscale cert` and `tailscale serve
+--https`. Nodes publish ACME DNS-01 TXT challenges through Headscale, which
+validates the request belongs to the authenticated node and writes the TXT RRset
+through a registered `libdns` provider.
+
+Headscale does not run an authoritative DNS server for this feature and does
+not store issued certificates or private keys. A concrete `libdns` provider
+must be registered in the Headscale build and configured under
+`dns.certificates`.
+
 ## 0.29.0 (2026-06-17)
 
 **Minimum supported Tailscale client version: v1.80.0**

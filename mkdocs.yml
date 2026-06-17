@@ -189,6 +189,7 @@ nav:
       - TLS: ref/tls.md
       - Policy: ref/policy.md
       - DNS: ref/dns.md
+      - Serve and certificates: ref/serve.md
       - DERP: ref/derp.md
       - API: ref/api.md
       - Tags: ref/tags.md

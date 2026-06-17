@@ -95,6 +95,7 @@ type Headscale struct {
 	extraRecordMan *dns.ExtraRecordsMan
 	authProvider   AuthProvider
 	mapBatcher     *mapper.Batcher
+	dnsCertManager *dnsCertificateManager
 
 	clientStreamsOpen sync.WaitGroup
 }
@@ -224,6 +225,13 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 			// Clone and carries the same "resolve locally" semantics
 			// ([tailcfg.DNSConfig.Routes] documents the empty-resolver form).
 			app.cfg.TailcfgDNSConfig.Routes[d.WithoutTrailingDot()] = []*dnstype.Resolver{}
+		}
+	}
+
+	if cfg.DNSConfig.Certificates.Enabled {
+		app.dnsCertManager, err = newDNSCertificateManager(cfg.DNSConfig.Certificates)
+		if err != nil {
+			return nil, fmt.Errorf("creating DNS certificate manager: %w", err)
 		}
 	}
 
