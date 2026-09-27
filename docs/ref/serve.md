@@ -119,6 +119,66 @@ it to delete expired challenge records (see [Record cleanup](#record-cleanup)).
 
 The factory receives `dns.certificates.provider_config`.
 
+### RFC 2136 provider
+
+Headscale ships an `rfc2136` provider for DNS servers that support
+[RFC 2136](https://www.rfc-editor.org/rfc/rfc2136) dynamic updates
+authenticated with TSIG, such as BIND or PowerDNS. It uses
+[`github.com/libdns/rfc2136`](https://github.com/libdns/rfc2136) and supports
+both `SetRecords` and `DeleteRecords`, so expired challenge records are
+deleted outright rather than left in the zone (see
+[Record cleanup](#record-cleanup)).
+
+You need:
+
+- A DNS server authoritative for `dns.certificates.zone` (or `dns.base_domain`
+  if `zone` is empty) that accepts dynamic updates for the
+  `_acme-challenge.*` names under it.
+- A TSIG key. Generate one with, for example:
+
+  ```console
+  tsig-keygen -a hmac-sha256 headscale.
+  ```
+
+  This prints a `key "headscale." { algorithm hmac-sha256; secret "..."; };`
+  block. Add it to the server's configuration together with an update-policy
+  grant limited to `_acme-challenge` records, for example in BIND:
+
+  ```
+  zone "example.com" {
+      type primary;
+      file "example.com.zone";
+      update-policy {
+          grant headscale. name _acme-challenge.example.com. txt;
+          grant headscale. wildcard *._acme-challenge.example.com. txt;
+      };
+  };
+  ```
+
+Configure it under `dns.certificates.provider_config`:
+
+```yaml
+dns:
+  certificates:
+    enabled: true
+    provider: "rfc2136"
+    zone: "example.com"
+    provider_config:
+      # The RFC 2136 server's address, host:port.
+      nameserver: "ns1.example.com:53"
+      # The TSIG key name from tsig-keygen.
+      key_name: "headscale."
+      # "hmac-sha256" (default) or "hmac-sha512".
+      key_algorithm: "hmac-sha256"
+      # The TSIG secret from tsig-keygen, base64. Prefer key_secret_path or
+      # key_secret_env over writing it into this file directly.
+      key_secret_path: /run/secrets/rfc2136_tsig_secret
+```
+
+`nameserver`, `key_name` and `key_secret` are required; `key_algorithm`
+defaults to `hmac-sha256`. `key_secret` follows the same `_path`/`_env`
+indirection as any other `provider_config` value.
+
 ## Security properties
 
 - Nodes can only publish `TXT` records.

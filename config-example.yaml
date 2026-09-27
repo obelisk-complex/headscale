@@ -354,6 +354,15 @@ dns:
     # provider_config:
     #   api_token_path: /run/secrets/dns_api_token
     #   api_token_env: DNS_API_TOKEN
+    #
+    # Example for provider: "rfc2136" (RFC 2136 TSIG-signed dynamic DNS
+    # updates, e.g. BIND or PowerDNS with an update-policy grant for the
+    # TSIG key). Generate a key with `tsig-keygen -a hmac-sha256 <key-name>`.
+    # provider_config:
+    #   nameserver: "ns1.example.com:53"
+    #   key_name: "headscale."
+    #   key_algorithm: "hmac-sha256" # or "hmac-sha512"
+    #   key_secret_path: /run/secrets/rfc2136_tsig_secret
     provider_config: {}
 
   # Whether to use the local DNS settings of a node or override the local DNS

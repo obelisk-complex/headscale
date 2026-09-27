@@ -77,8 +77,10 @@ or environment variables via `<key>_path` / `<key>_env` in `provider_config`.
 Headscale does not run an authoritative DNS server for this feature and does
 not store issued certificates or private keys. A concrete `libdns` provider
 must be registered in the Headscale build and configured under
-`dns.certificates`. This fork ships the provider-neutral registry only; no
-provider is bundled yet.
+`dns.certificates`. This fork bundles an `rfc2136` provider (TSIG-signed RFC
+2136 dynamic updates, e.g. BIND or PowerDNS) using
+[`github.com/libdns/rfc2136`](https://github.com/libdns/rfc2136); see
+[`docs/ref/serve.md`](docs/ref/serve.md#rfc-2136-provider) for setup.
 
 Ported from upstream juanfont/headscale PR #3321 (magndotcc), adapted to this
 fork's `configValidator`/`ConfigError` validation pattern.
