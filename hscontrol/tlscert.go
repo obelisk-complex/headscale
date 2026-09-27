@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +18,9 @@ import (
 const (
 	dnsCertRecordRetention = 10 * time.Minute
 
+	dnsPropagationPollInterval = 2 * time.Second
+	dnsPropagationQueryTimeout = 5 * time.Second
+
 	// acmeDNS01ValueLength is the length of an unpadded base64url SHA-256
 	// digest, the only value an ACME DNS-01 TXT record carries.
 	acmeDNS01ValueLength = 43
@@ -27,6 +32,7 @@ var (
 	errDNSCertRecordType     = errors.New("only TXT records are supported")
 	errDNSCertRecordName     = errors.New("DNS record name is not allowed")
 	errDNSCertRecordValue    = errors.New("invalid TXT record value")
+	errDNSCertPropagation    = errors.New("DNS record not visible on authoritative name servers")
 )
 
 // DNSCertificateProviderFactory constructs a libdns RecordSetter from the
@@ -93,13 +99,23 @@ func newDNSCertificateManagerForSetter(
 	cfg types.DNSCertificatesConfig,
 	setter libdns.RecordSetter,
 ) *dnsCertificateManager {
-	return &dnsCertificateManager{
+	m := &dnsCertificateManager{
 		zone:            strings.TrimSuffix(strings.ToLower(cfg.Zone), "."),
 		ttl:             cfg.TTL,
 		propagationWait: cfg.PropagationWait,
 		setter:          setter,
 		records:         make(map[string]map[string]time.Time),
 	}
+
+	if cfg.PropagationCheck {
+		m.propagation = &dnsPropagationChecker{
+			resolver:     netPropagationResolver{},
+			timeout:      cfg.PropagationTimeout,
+			pollInterval: dnsPropagationPollInterval,
+		}
+	}
+
+	return m
 }
 
 type dnsCertificateManager struct {
@@ -108,10 +124,17 @@ type dnsCertificateManager struct {
 	propagationWait time.Duration
 	setter          libdns.RecordSetter
 
+	// propagation, when set, holds SetDNS responses until the record is
+	// served by every authoritative name server of its zone.
+	propagation *dnsPropagationChecker
+
 	mu      sync.Mutex
 	records map[string]map[string]time.Time
 }
 
+// setDNS publishes the node's ACME DNS-01 TXT value and returns once the
+// record can be expected to be visible to the ACME server: tailscaled asks
+// the CA to validate as soon as this call returns.
 func (m *dnsCertificateManager) setDNS(
 	ctx context.Context,
 	node types.NodeView,
@@ -133,6 +156,25 @@ func (m *dnsCertificateManager) setDNS(
 		return fmt.Errorf("challenge name %q is outside the configured zone %q", name, m.zone)
 	}
 
+	if err := m.publish(ctx, name, value); err != nil {
+		return err
+	}
+
+	written := time.Now()
+
+	if m.propagation != nil {
+		if err := m.propagation.wait(ctx, name, m.zone, value); err != nil {
+			return err
+		}
+	}
+
+	return sleepCtx(ctx, m.propagationWait-time.Since(written))
+}
+
+// publish writes value into the TXT RRset for name. The lock is held only
+// for the provider write, never while waiting for propagation, so a slow
+// zone does not stall other nodes.
+func (m *dnsCertificateManager) publish(ctx context.Context, name, value string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -165,18 +207,199 @@ func (m *dnsCertificateManager) setDNS(
 		return fmt.Errorf("setting ACME DNS-01 TXT record: %w", err)
 	}
 
-	if m.propagationWait > 0 {
-		timer := time.NewTimer(m.propagationWait)
-		defer timer.Stop()
+	return nil
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// dnsPropagationResolver is the view of DNS used to confirm that a TXT
+// record is published. It exists so tests can run without a network.
+type dnsPropagationResolver interface {
+	// LookupNS returns the name server host names delegated for name.
+	LookupNS(ctx context.Context, name string) ([]string, error)
+	// LookupHost returns the IP addresses of host.
+	LookupHost(ctx context.Context, host string) ([]string, error)
+	// LookupTXTAt queries the name server at addr (host:port) directly,
+	// bypassing any caching resolver.
+	LookupTXTAt(ctx context.Context, addr, name string) ([]string, error)
+}
+
+type netPropagationResolver struct{}
+
+func (netPropagationResolver) LookupNS(ctx context.Context, name string) ([]string, error) {
+	nss, err := net.DefaultResolver.LookupNS(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+
+	hosts := make([]string, 0, len(nss))
+	for _, ns := range nss {
+		hosts = append(hosts, ns.Host)
+	}
+
+	return hosts, nil
+}
+
+func (netPropagationResolver) LookupHost(ctx context.Context, host string) ([]string, error) {
+	return net.DefaultResolver.LookupHost(ctx, host)
+}
+
+func (netPropagationResolver) LookupTXTAt(
+	ctx context.Context,
+	addr, name string,
+) ([]string, error) {
+	// The pure Go resolver sends every query through Dial, so pinning the
+	// dial target makes it talk to exactly this server. It keeps no cache.
+	r := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var d net.Dialer
+
+			return d.DialContext(ctx, network, addr)
+		},
+	}
+
+	return r.LookupTXT(ctx, name)
+}
+
+// dnsPropagationChecker polls a zone's authoritative name servers until
+// each serves an expected TXT value.
+type dnsPropagationChecker struct {
+	resolver     dnsPropagationResolver
+	timeout      time.Duration
+	pollInterval time.Duration
+}
+
+// wait blocks until every authoritative name server for name (as found by
+// walking from name up to zone) serves value, the timeout passes, or ctx
+// ends. A name server counts as serving the value when any one of its
+// addresses answers with it; addresses that cannot be reached from here
+// are not waited on individually.
+func (c *dnsPropagationChecker) wait(ctx context.Context, name, zone, value string) error {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+
+	var (
+		servers   map[string][]string
+		confirmed = make(map[string]bool)
+		lastErr   error
+	)
+
+	for {
+		if servers == nil {
+			servers, lastErr = c.authoritativeServers(ctx, name, zone)
+		}
+
+		for host, addrs := range servers {
+			if confirmed[host] {
+				continue
+			}
+
+			for _, addr := range addrs {
+				qctx, qcancel := context.WithTimeout(ctx, dnsPropagationQueryTimeout)
+				txts, err := c.resolver.LookupTXTAt(qctx, net.JoinHostPort(addr, "53"), name)
+				qcancel()
+
+				if slices.Contains(txts, value) {
+					confirmed[host] = true
+
+					break
+				}
+
+				lastErr = fmt.Errorf("%s (%s): %w", host, addr, err)
+				if err == nil {
+					lastErr = fmt.Errorf("%s (%s): value not served yet", host, addr)
+				}
+			}
+		}
+
+		if servers != nil && len(confirmed) == len(servers) {
+			return nil
+		}
 
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
-		case <-timer.C:
+			pending := make([]string, 0, len(servers))
+			for host := range servers {
+				if !confirmed[host] {
+					pending = append(pending, host)
+				}
+			}
+			slices.Sort(pending)
+
+			return fmt.Errorf(
+				"%w: %s not served by %v within %s: %w",
+				errDNSCertPropagation, name, pending, c.timeout, errors.Join(lastErr, ctx.Err()),
+			)
+		case <-time.After(c.pollInterval):
+		}
+	}
+}
+
+// authoritativeServers finds the zone cut for name by walking up from name
+// to zone until an NS RRset is found, then resolves each name server's
+// addresses. Name servers without addresses are left out, since the ACME
+// server cannot query them either.
+func (c *dnsPropagationChecker) authoritativeServers(
+	ctx context.Context,
+	name, zone string,
+) (map[string][]string, error) {
+	zone = canonicalDNSName(zone)
+
+	var hosts []string
+
+	for candidate := name; ; {
+		found, err := c.resolver.LookupNS(ctx, candidate)
+		if err == nil && len(found) > 0 {
+			hosts = found
+
+			break
+		}
+
+		if candidate == zone || ctx.Err() != nil {
+			return nil, fmt.Errorf("no NS records found for %s up to zone %s: %w", name, zone, err)
+		}
+
+		_, candidate, _ = strings.Cut(candidate, ".")
+		if candidate == "" {
+			return nil, fmt.Errorf("%s is not inside zone %s", name, zone)
 		}
 	}
 
-	return nil
+	servers := make(map[string][]string, len(hosts))
+
+	var errs []error
+
+	for _, host := range hosts {
+		addrs, err := c.resolver.LookupHost(ctx, host)
+		if err != nil || len(addrs) == 0 {
+			errs = append(errs, fmt.Errorf("resolving name server %s: %w", host, err))
+
+			continue
+		}
+
+		servers[canonicalDNSName(host)] = addrs
+	}
+
+	if len(servers) == 0 {
+		return nil, errors.Join(errs...)
+	}
+
+	return servers, nil
 }
 
 func (m *dnsCertificateManager) purgeExpiredLocked(now time.Time) {

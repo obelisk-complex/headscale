@@ -842,3 +842,23 @@ func TestPollNetMapHandler_ForeignMachineKeyStillRejected(t *testing.T) {
 
 	assert.Equal(t, http.StatusNotFound, rec.Code, "body=%q", rec.Body.String())
 }
+
+func TestSetDNSHandlerPropagationTimeoutIsGatewayTimeout(t *testing.T) {
+	t.Parallel()
+
+	app, node := setDNSTestApp(t, &fakeRecordSetter{})
+	app.dnsCertManager.propagation = &dnsPropagationChecker{
+		resolver:     &fakePropagationResolver{},
+		timeout:      20 * time.Millisecond,
+		pollInterval: time.Millisecond,
+	}
+
+	rec := doSetDNS(t, app, node.MachineKey, tailcfg.SetDNSRequest{
+		NodeKey: node.NodeKey,
+		Name:    "_acme-challenge.cert-node.example.com",
+		Type:    "TXT",
+		Value:   testACMEValue("challenge"),
+	})
+
+	require.Equal(t, http.StatusGatewayTimeout, rec.Code, "body=%s", rec.Body.String())
+}

@@ -704,12 +704,14 @@ func TestDNSCertificateConfig(t *testing.T) {
       token: secret-token
 `,
 			want: DNSCertificatesConfig{
-				Enabled:         true,
-				Provider:        "test-provider",
-				ProviderConfig:  map[string]string{"token": "secret-token"},
-				Zone:            "example.com",
-				TTL:             2 * time.Minute,
-				PropagationWait: 3 * time.Second,
+				Enabled:            true,
+				Provider:           "test-provider",
+				ProviderConfig:     map[string]string{"token": "secret-token"},
+				Zone:               "example.com",
+				TTL:                2 * time.Minute,
+				PropagationCheck:   true,
+				PropagationTimeout: 90 * time.Second,
+				PropagationWait:    3 * time.Second,
 			},
 		},
 		{
@@ -745,6 +747,41 @@ func TestDNSCertificateConfig(t *testing.T) {
     enabled: true
 `,
 			wantErr: "dns.certificates.enabled requires dns.certificates.provider to be set",
+		},
+		{
+			name: "propagation-check-disabled",
+			dnsYAML: `
+  magic_dns: true
+  base_domain: ts.example.com
+  override_local_dns: false
+  certificates:
+    enabled: true
+    provider: test-provider
+    zone: example.com
+    propagation_check: false
+    propagation_wait: 30s
+`,
+			want: DNSCertificatesConfig{
+				Enabled:            true,
+				Provider:           "test-provider",
+				Zone:               "example.com",
+				PropagationCheck:   false,
+				PropagationTimeout: 90 * time.Second,
+				PropagationWait:    30 * time.Second,
+			},
+		},
+		{
+			name: "propagation-timeout-zero",
+			dnsYAML: `
+  magic_dns: true
+  base_domain: example.com
+  override_local_dns: false
+  certificates:
+    enabled: true
+    provider: test-provider
+    propagation_timeout: 0s
+`,
+			wantErr: "dns.certificates.propagation_timeout must be positive",
 		},
 		{
 			name: "base-domain-outside-zone",

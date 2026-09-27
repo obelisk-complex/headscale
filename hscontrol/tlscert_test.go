@@ -4,12 +4,16 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
+	"net"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/libdns/libdns"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
@@ -221,4 +225,360 @@ func TestDNSCertificateManagerRejectsNameOutsideZone(t *testing.T) {
 	require.Error(t, err)
 	require.False(t, isSetDNSRequestError(err), "zone mismatch is a server misconfiguration")
 	require.Nil(t, setter.records)
+}
+
+// fakePropagationResolver models a small DNS hierarchy. ns maps a name to
+// its NS host names, hosts maps a host to its addresses, and served maps
+// "addr|name" to the TXT values that server answers with. unreachable
+// addresses fail every query. visibleAfter delays a server's answers by a
+// number of queries to model a zone still propagating.
+type fakePropagationResolver struct {
+	mu           sync.Mutex
+	ns           map[string][]string
+	hosts        map[string][]string
+	served       map[string][]string
+	unreachable  map[string]bool
+	visibleAfter map[string]int
+	queries      map[string]int
+}
+
+func (f *fakePropagationResolver) LookupNS(_ context.Context, name string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if hosts, ok := f.ns[name]; ok {
+		return hosts, nil
+	}
+
+	return nil, &net.DNSError{Err: "no such host", Name: name, IsNotFound: true}
+}
+
+func (f *fakePropagationResolver) LookupHost(_ context.Context, host string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if addrs, ok := f.hosts[host]; ok {
+		return addrs, nil
+	}
+
+	return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+}
+
+func (f *fakePropagationResolver) LookupTXTAt(
+	_ context.Context,
+	addr, name string,
+) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.queries == nil {
+		f.queries = make(map[string]int)
+	}
+	f.queries[addr]++
+
+	if f.unreachable[addr] {
+		return nil, errors.New("connect: network is unreachable")
+	}
+
+	if f.queries[addr] <= f.visibleAfter[addr] {
+		return nil, &net.DNSError{Err: "no such host", Name: name, IsNotFound: true}
+	}
+
+	return f.served[addr+"|"+name], nil
+}
+
+func (f *fakePropagationResolver) queryCount(addr string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.queries[addr]
+}
+
+const testChallengeFQDN = "_acme-challenge.node1.example.com."
+
+func testPropagationManager(
+	resolver dnsPropagationResolver,
+	timeout time.Duration,
+) (*dnsCertificateManager, *fakeRecordSetter) {
+	setter := &fakeRecordSetter{}
+	manager := newDNSCertificateManagerForSetter(types.DNSCertificatesConfig{
+		Zone: "example.com",
+	}, setter)
+	manager.propagation = &dnsPropagationChecker{
+		resolver:     resolver,
+		timeout:      timeout,
+		pollInterval: time.Millisecond,
+	}
+
+	return manager, setter
+}
+
+func testChallengeRequest(node types.NodeView, value string) tailcfg.SetDNSRequest {
+	return tailcfg.SetDNSRequest{
+		NodeKey: node.NodeKey(),
+		Name:    testChallengeFQDN,
+		Type:    "TXT",
+		Value:   value,
+	}
+}
+
+func TestDNSPropagationWaitsForEveryAuthoritativeServer(t *testing.T) {
+	t.Parallel()
+
+	value := testACMEValue("challenge")
+	resolver := &fakePropagationResolver{
+		ns: map[string][]string{"example.com.": {"ns1.example.net.", "ns2.example.net."}},
+		hosts: map[string][]string{
+			"ns1.example.net.": {"192.0.2.1"},
+			"ns2.example.net.": {"192.0.2.2"},
+		},
+		served: map[string][]string{
+			"192.0.2.1:53|" + testChallengeFQDN: {"unrelated", value},
+			"192.0.2.2:53|" + testChallengeFQDN: {value},
+		},
+		// ns2 lags behind ns1.
+		visibleAfter: map[string]int{"192.0.2.2:53": 3},
+	}
+	manager, _ := testPropagationManager(resolver, time.Minute)
+	node := testCertNode()
+
+	require.NoError(t, manager.setDNS(t.Context(), node, "example.com", testChallengeRequest(node, value)))
+
+	require.Equal(t, 1, resolver.queryCount("192.0.2.1:53"), "confirmed server is not polled again")
+	require.Equal(t, 4, resolver.queryCount("192.0.2.2:53"), "lagging server is polled until it serves the value")
+}
+
+func TestDNSPropagationFindsDelegatedZoneCut(t *testing.T) {
+	t.Parallel()
+
+	value := testACMEValue("challenge")
+	resolver := &fakePropagationResolver{
+		// node1.example.com is delegated away from example.com; only the
+		// delegated servers are authoritative for the challenge name.
+		ns: map[string][]string{
+			"example.com.":       {"parent.example.net."},
+			"node1.example.com.": {"child.example.net."},
+		},
+		hosts: map[string][]string{
+			"parent.example.net.": {"192.0.2.1"},
+			"child.example.net.":  {"192.0.2.9"},
+		},
+		served: map[string][]string{
+			"192.0.2.9:53|" + testChallengeFQDN: {value},
+		},
+	}
+	manager, _ := testPropagationManager(resolver, time.Minute)
+	node := testCertNode()
+
+	require.NoError(t, manager.setDNS(t.Context(), node, "example.com", testChallengeRequest(node, value)))
+	require.Zero(t, resolver.queryCount("192.0.2.1:53"), "parent zone servers are not authoritative")
+}
+
+func TestDNSPropagationToleratesUnreachableAddress(t *testing.T) {
+	t.Parallel()
+
+	value := testACMEValue("challenge")
+	resolver := &fakePropagationResolver{
+		ns: map[string][]string{"example.com.": {"ns1.example.net."}},
+		hosts: map[string][]string{
+			"ns1.example.net.": {"2001:db8::1", "192.0.2.1"},
+		},
+		served: map[string][]string{
+			"192.0.2.1:53|" + testChallengeFQDN: {value},
+		},
+		unreachable: map[string]bool{"[2001:db8::1]:53": true},
+	}
+	manager, _ := testPropagationManager(resolver, time.Minute)
+	node := testCertNode()
+
+	require.NoError(t, manager.setDNS(t.Context(), node, "example.com", testChallengeRequest(node, value)))
+}
+
+func TestDNSPropagationTimesOut(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		resolver *fakePropagationResolver
+	}{
+		{
+			name: "value-never-served",
+			resolver: &fakePropagationResolver{
+				ns:    map[string][]string{"example.com.": {"ns1.example.net.", "ns2.example.net."}},
+				hosts: map[string][]string{"ns1.example.net.": {"192.0.2.1"}, "ns2.example.net.": {"192.0.2.2"}},
+				served: map[string][]string{
+					"192.0.2.1:53|" + testChallengeFQDN: {testACMEValue("challenge")},
+					"192.0.2.2:53|" + testChallengeFQDN: {testACMEValue("stale")},
+				},
+			},
+		},
+		{
+			name:     "no-ns-records",
+			resolver: &fakePropagationResolver{},
+		},
+		{
+			name: "ns-without-addresses",
+			resolver: &fakePropagationResolver{
+				ns: map[string][]string{"example.com.": {"ns1.example.net."}},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			manager, _ := testPropagationManager(tt.resolver, 50*time.Millisecond)
+			node := testCertNode()
+
+			err := manager.setDNS(
+				t.Context(), node, "example.com",
+				testChallengeRequest(node, testACMEValue("challenge")),
+			)
+			require.ErrorIs(t, err, errDNSCertPropagation)
+			require.False(t, isSetDNSRequestError(err))
+		})
+	}
+}
+
+func TestDNSPropagationRespectsRequestContext(t *testing.T) {
+	t.Parallel()
+
+	manager, _ := testPropagationManager(&fakePropagationResolver{}, time.Hour)
+	node := testCertNode()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := manager.setDNS(ctx, node, "example.com", testChallengeRequest(node, testACMEValue("challenge")))
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Less(t, time.Since(start), 5*time.Second)
+}
+
+// TestDNSPropagationDoesNotBlockOtherNodes guards against holding the
+// manager lock while one node's record propagates.
+func TestDNSPropagationDoesNotBlockOtherNodes(t *testing.T) {
+	t.Parallel()
+
+	slowValue := testACMEValue("slow")
+	fastValue := testACMEValue("fast")
+	resolver := &fakePropagationResolver{
+		ns:    map[string][]string{"example.com.": {"ns1.example.net."}},
+		hosts: map[string][]string{"ns1.example.net.": {"192.0.2.1"}},
+		served: map[string][]string{
+			"192.0.2.1:53|_acme-challenge.node2.example.com.": {fastValue},
+		},
+	}
+	manager, _ := testPropagationManager(resolver, time.Hour)
+
+	slowNode := testCertNode()
+	fastNode := (&types.Node{
+		ID:        2,
+		GivenName: "node2",
+		NodeKey:   key.NewNode().Public(),
+	}).View()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	slowDone := make(chan error, 1)
+
+	go func() {
+		slowDone <- manager.setDNS(ctx, slowNode, "example.com", testChallengeRequest(slowNode, slowValue))
+	}()
+
+	require.Eventually(t, func() bool {
+		return resolver.queryCount("192.0.2.1:53") > 0
+	}, 5*time.Second, time.Millisecond, "slow node is polling")
+
+	require.NoError(t, manager.setDNS(t.Context(), fastNode, "example.com", tailcfg.SetDNSRequest{
+		NodeKey: fastNode.NodeKey(),
+		Name:    "_acme-challenge.node2.example.com",
+		Type:    "TXT",
+		Value:   fastValue,
+	}))
+
+	cancel()
+	require.ErrorIs(t, <-slowDone, context.Canceled)
+}
+
+func TestDNSPropagationWaitIsMinimum(t *testing.T) {
+	t.Parallel()
+
+	setter := &fakeRecordSetter{}
+	manager := newDNSCertificateManagerForSetter(types.DNSCertificatesConfig{
+		Zone:            "example.com",
+		PropagationWait: 50 * time.Millisecond,
+	}, setter)
+	require.Nil(t, manager.propagation, "check is off unless configured")
+
+	node := testCertNode()
+	start := time.Now()
+	require.NoError(t, manager.setDNS(t.Context(), node, "example.com", testChallengeRequest(node, testACMEValue("challenge"))))
+	require.GreaterOrEqual(t, time.Since(start), 50*time.Millisecond)
+}
+
+// TestNetPropagationResolverQueriesPinnedServer checks that LookupTXTAt
+// sends its query to the given server rather than the system resolver.
+func TestNetPropagationResolverQueriesPinnedServer(t *testing.T) {
+	t.Parallel()
+
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+
+	value := testACMEValue("challenge")
+	queries := make(chan string, 16)
+
+	go func() {
+		buf := make([]byte, 1500)
+
+		for {
+			n, from, err := conn.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+
+			var p dnsmessage.Parser
+
+			hdr, err := p.Start(buf[:n])
+			if err != nil {
+				continue
+			}
+
+			q, err := p.Question()
+			if err != nil {
+				continue
+			}
+			queries <- q.Name.String()
+
+			b := dnsmessage.NewBuilder(nil, dnsmessage.Header{
+				ID: hdr.ID, Response: true, Authoritative: true,
+			})
+			b.EnableCompression()
+			_ = b.StartQuestions()
+			_ = b.Question(q)
+			_ = b.StartAnswers()
+
+			if q.Type == dnsmessage.TypeTXT {
+				_ = b.TXTResource(
+					dnsmessage.ResourceHeader{Name: q.Name, Class: dnsmessage.ClassINET, TTL: 60},
+					dnsmessage.TXTResource{TXT: []string{value}},
+				)
+			}
+
+			msg, err := b.Finish()
+			if err != nil {
+				continue
+			}
+
+			_, _ = conn.WriteTo(msg, from)
+		}
+	}()
+
+	txts, err := netPropagationResolver{}.LookupTXTAt(
+		t.Context(), conn.LocalAddr().String(), testChallengeFQDN,
+	)
+	require.NoError(t, err)
+	require.Equal(t, []string{value}, txts)
+	require.Equal(t, testChallengeFQDN, <-queries)
 }

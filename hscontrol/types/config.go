@@ -187,9 +187,17 @@ type DNSCertificatesConfig struct {
 	// defaults.
 	TTL time.Duration
 
-	// PropagationWait optionally delays the SetDNS response after libdns
-	// accepts the TXT record, giving eventually-consistent providers time to
-	// publish the record before the client asks ACME to validate it.
+	// PropagationCheck holds the SetDNS response until every authoritative
+	// name server of the zone serves the new TXT value. tailscaled asks the
+	// ACME server to validate as soon as SetDNS returns.
+	PropagationCheck bool `mapstructure:"propagation_check"`
+
+	// PropagationTimeout bounds PropagationCheck.
+	PropagationTimeout time.Duration `mapstructure:"propagation_timeout"`
+
+	// PropagationWait is the minimum time between the provider accepting
+	// the TXT record and the SetDNS response. With PropagationCheck off it
+	// is the only propagation allowance.
 	PropagationWait time.Duration `mapstructure:"propagation_wait"`
 }
 
@@ -478,6 +486,8 @@ func LoadConfig(path string, isFile bool) error {
 	viper.SetDefault("dns.nameservers.split", map[string]string{})
 	viper.SetDefault("dns.search_domains", []string{})
 	viper.SetDefault("dns.certificates.enabled", false)
+	viper.SetDefault("dns.certificates.propagation_check", true)
+	viper.SetDefault("dns.certificates.propagation_timeout", "90s")
 
 	viper.SetDefault("derp.server.enabled", false)
 	viper.SetDefault("derp.server.verify_clients", true)
@@ -1070,6 +1080,10 @@ func dns() (DNSConfig, error) {
 	}
 	dns.Certificates.Zone = viper.GetString("dns.certificates.zone")
 	dns.Certificates.TTL = viper.GetDuration("dns.certificates.ttl")
+	dns.Certificates.PropagationCheck = viper.GetBool("dns.certificates.propagation_check")
+	dns.Certificates.PropagationTimeout = viper.GetDuration(
+		"dns.certificates.propagation_timeout",
+	)
 	dns.Certificates.PropagationWait = viper.GetDuration(
 		"dns.certificates.propagation_wait",
 	)
@@ -1452,6 +1466,26 @@ func LoadServerConfig() (*Config, error) {
 
 		if dnsConfig.Certificates.Zone == "" {
 			dnsConfig.Certificates.Zone = dnsConfig.BaseDomain
+		}
+
+		if dnsConfig.Certificates.PropagationCheck &&
+			dnsConfig.Certificates.PropagationTimeout <= 0 {
+			v.Add(&ConfigError{
+				Reason: "dns.certificates.propagation_timeout must be positive when dns.certificates.propagation_check is enabled",
+				Current: []KV{
+					{"dns.certificates.propagation_timeout", dnsConfig.Certificates.PropagationTimeout},
+				},
+				Hint: "set a timeout such as 90s, or disable dns.certificates.propagation_check",
+			})
+		}
+
+		if dnsConfig.Certificates.PropagationWait < 0 {
+			v.Add(&ConfigError{
+				Reason: "dns.certificates.propagation_wait must not be negative",
+				Current: []KV{
+					{"dns.certificates.propagation_wait", dnsConfig.Certificates.PropagationWait},
+				},
+			})
 		}
 
 		zone := strings.ToLower(strings.TrimSuffix(dnsConfig.Certificates.Zone, "."))

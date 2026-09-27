@@ -27,7 +27,9 @@ publish ACME DNS-01 TXT challenge records for the node.
    the requested TXT name belongs to that node's own FQDN.
 6. Headscale publishes the TXT RRset through the configured `libdns`
    `RecordSetter`.
-7. The client asks the ACME CA to validate DNS-01 and stores the issued
+7. Headscale waits until every authoritative name server of the zone serves
+   the new value (see [Propagation](#propagation)), then answers the node.
+8. The client asks the ACME CA to validate DNS-01 and stores the issued
    certificate locally.
 
 ## Configuration
@@ -42,7 +44,9 @@ dns:
     provider: "provider-name"
     zone: "example.com"
     ttl: 2m
-    propagation_wait: 10s
+    propagation_check: true
+    propagation_timeout: 90s
+    propagation_wait: 0s
     provider_config:
       token: "provider-api-token"
 ```
@@ -57,6 +61,30 @@ dns:
 `zone` defaults to `dns.base_domain` when empty. `provider_config` is passed
 unchanged to the registered provider factory and is omitted from JSON debug
 configuration output because it commonly contains API credentials.
+
+## Propagation
+
+tailscaled asks the ACME CA to validate the challenge as soon as
+`/machine/set-dns` returns. If the CA queries a name server that has not yet
+received the record, validation fails and the certificate is not issued.
+
+With `propagation_check: true` (the default) Headscale:
+
+1. finds the zone cut for `_acme-challenge.<node>.<base_domain>` by looking up
+   NS records from that name upwards until `zone`;
+2. resolves every name server's addresses;
+3. queries each name server directly on port 53, bypassing caching resolvers,
+   until each serves the new TXT value. A name server counts once any one of
+   its addresses answers with the value.
+
+If that does not happen within `propagation_timeout` (default `90s`), the node
+receives `504 Gateway Timeout` and retries later. tailscaled's background
+renewal gives the whole ACME order two minutes, so keep the timeout below that.
+
+Headscale needs outbound DNS (UDP and TCP port 53) to the zone's authoritative
+servers for this. Where that is not possible, set `propagation_check: false`
+and use `propagation_wait` as a fixed delay instead. `propagation_wait` is also
+honoured as a minimum when the check is on.
 
 ## Provider registration
 

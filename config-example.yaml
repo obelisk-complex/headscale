@@ -327,8 +327,18 @@ dns:
     zone: ""
     # TXT record TTL. Empty or 0 uses the provider default.
     ttl: 0s
-    # Optional delay after libdns accepts the record, useful for eventually
-    # consistent DNS provider APIs.
+    # The node asks the ACME CA to validate as soon as Headscale answers, so
+    # Headscale holds the answer until every authoritative name server of the
+    # zone serves the new TXT value. It finds them by walking NS records from
+    # the challenge name up to `zone` and queries them directly over port 53.
+    # Disable only if Headscale cannot reach those servers (egress filtering,
+    # split-horizon DNS); then rely on propagation_wait.
+    propagation_check: true
+    # Upper bound for propagation_check. tailscaled's background renewal
+    # gives the whole ACME order 2 minutes, so keep this well below that.
+    propagation_timeout: 90s
+    # Minimum time between the provider accepting the record and Headscale
+    # answering the node, on top of propagation_check.
     propagation_wait: 0s
     # Provider-specific settings passed unchanged to the registered provider
     # factory. Exact keys depend on the provider package used in your build.

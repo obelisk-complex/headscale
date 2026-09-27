@@ -878,8 +878,12 @@ func (ns *noiseServer) SetDNSHandler(writer http.ResponseWriter, req *http.Reque
 	)
 	if err != nil {
 		code, msg := http.StatusBadGateway, "publishing DNS record failed"
-		if isSetDNSRequestError(err) {
+
+		switch {
+		case isSetDNSRequestError(err):
 			code, msg = http.StatusBadRequest, "invalid DNS record update"
+		case errors.Is(err, errDNSCertPropagation):
+			code, msg = http.StatusGatewayTimeout, "DNS record did not propagate in time"
 		}
 
 		httpError(writer, NewHTTPError(code, msg, err))
