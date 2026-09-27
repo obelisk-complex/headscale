@@ -23,6 +23,7 @@ require (
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/jagottsicher/termcolor v1.0.2
 	github.com/libdns/libdns v1.1.1
+	github.com/libdns/rfc2136 v1.0.1
 	github.com/oapi-codegen/runtime v1.4.1
 	github.com/oauth2-proxy/mockoidc v0.0.0-20240214162133-caebfff84d25
 	github.com/ory/dockertest/v3 v3.12.0
@@ -174,6 +175,7 @@ require (
 	github.com/mattn/go-runewidth v0.0.24 // indirect
 	github.com/mdlayher/netlink v1.8.0 // indirect
 	github.com/mdlayher/socket v0.5.1 // indirect
+	github.com/miekg/dns v1.1.64 // indirect
 	github.com/mitchellh/go-ps v1.0.0 // indirect
 	github.com/moby/docker-image-spec v1.3.1 // indirect
 	github.com/moby/moby/api v1.54.2 // indirect

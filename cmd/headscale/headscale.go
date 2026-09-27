@@ -6,6 +6,10 @@ import (
 
 	"github.com/jagottsicher/termcolor"
 	"github.com/juanfont/headscale/cmd/headscale/cli"
+	// Concrete DNS certificate providers register themselves with
+	// hscontrol.RegisterDNSCertificateProvider from their init function; they
+	// must be imported here to be available under dns.certificates.provider.
+	_ "github.com/juanfont/headscale/hscontrol/dnscert/rfc2136"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
