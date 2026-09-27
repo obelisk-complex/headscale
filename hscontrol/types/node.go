@@ -1246,6 +1246,13 @@ func (nv NodeView) TailNode(
 		capMap[nodecap.FileSharing] = []tailcfg.RawMessage{}
 	}
 
+	// The https cap is the client's "HTTPS certificates are enabled for
+	// this tailnet" signal; without it `tailscale serve --https` asks
+	// control to enable the feature (/machine/feature/query) and fails.
+	if cfg.DNSConfig.Certificates.Enabled {
+		capMap[nodecap.HTTPS] = []tailcfg.RawMessage{}
+	}
+
 	// default-auto-update is always emitted; the value is a JSON bool
 	// reflecting cfg.AutoUpdate.Enabled. Clients read this on first
 	// netmap and store the default locally; subsequent control-plane

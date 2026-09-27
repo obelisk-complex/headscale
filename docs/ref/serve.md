@@ -10,12 +10,16 @@ publish ACME DNS-01 TXT challenge records for the node.
 
 ## Certificate flow
 
-1. Headscale advertises the node's FQDN in `DNSConfig.CertDomains`.
-   This is the client signal that avoids:
+1. Headscale advertises the node's FQDN in `DNSConfig.CertDomains` and gives
+   the node the `https` capability. The first is the client signal that
+   avoids:
 
    ```console
    HTTPS cert support is not enabled/configured for your tailnet.
    ```
+
+   The second lets `tailscale serve --https` start without asking the
+   control server to enable HTTPS, which Headscale does not implement.
 
 2. The node runs `tailscale cert <node>.<base_domain>` or
    `tailscale serve --https`.
