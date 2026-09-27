@@ -294,6 +294,7 @@ jobs:
           - TestUserCreateCommand
           - TestUserCommandValidation
           - TestDERPVerifyEndpoint
+          - TestDNSCertificatesServeHTTPS
           - TestResolveMagicDNS
           - TestResolveMagicDNSExtraRecordsPath
           - TestDERPServerScenario

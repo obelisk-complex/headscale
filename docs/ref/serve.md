@@ -10,12 +10,16 @@ publish ACME DNS-01 TXT challenge records for the node.
 
 ## Certificate flow
 
-1. Headscale advertises the node's FQDN in `DNSConfig.CertDomains`.
-   This is the client signal that avoids:
+1. Headscale advertises the node's FQDN in `DNSConfig.CertDomains` and gives
+   the node the `https` capability. The first is the client signal that
+   avoids:
 
    ```console
    HTTPS cert support is not enabled/configured for your tailnet.
    ```
+
+   The second lets `tailscale serve --https` start without asking the
+   control server to enable HTTPS, which Headscale does not implement.
 
 2. The node runs `tailscale cert <node>.<base_domain>` or
    `tailscale serve --https`.
@@ -178,6 +182,99 @@ dns:
 `nameserver`, `key_name` and `key_secret` are required; `key_algorithm`
 defaults to `hmac-sha256`. `key_secret` follows the same `_path`/`_env`
 indirection as any other `provider_config` value.
+
+## Webhook provider
+
+Headscale ships one provider built in: `webhook`. It posts the TXT RRset as
+JSON to an HTTP(S) endpoint you run, so any DNS backend — a small script, a
+cloud API shim, a test double — can be plugged in without a Headscale build
+that imports that vendor's SDK. It is the escape hatch instead of a built-in
+client per DNS vendor, and it is also what Headscale's own integration tests
+use, fronting [pebble-challtestsrv](https://github.com/letsencrypt/pebble)'s
+`/set-txt`/`/clear-txt` HTTP API with a thin adapter (pebble-challtestsrv
+takes one `(host, value)` pair per call; the adapter fans a `records` array
+out to it).
+
+```yaml
+dns:
+  certificates:
+    provider: webhook
+    provider_config:
+      set_url: https://dns-shim.internal/set
+      delete_url: https://dns-shim.internal/delete # optional
+      auth_token_path: /run/secrets/dns_webhook_token
+      hmac_secret_env: DNS_WEBHOOK_HMAC_SECRET
+      timeout: 10s
+      max_retries: "2"
+      insecure_http: "false"
+```
+
+`provider_config` keys:
+
+| Key             | Required | Default | Meaning                                                                          |
+| --------------- | -------- | ------- | --------------------------------------------------------------------------------- |
+| `set_url`       | yes      | -       | Endpoint called for every `SetRecords`.                                           |
+| `delete_url`    | no       | unset   | Endpoint called for record deletion. Unset = the provider does not implement `libdns.RecordDeleter`, matching every other optional-delete provider (see [Record cleanup](#record-cleanup)). |
+| `auth_token`    | no       | unset   | Sent as `Authorization: Bearer <auth_token>`. Give it as `auth_token_path` or `auth_token_env` to keep it out of the config file (see [Configuration](#configuration)). |
+| `hmac_secret`   | no       | unset   | Signs the raw request body with HMAC-SHA256, sent as `X-Headscale-Signature: sha256=<hex>`. Also resolvable via `_path`/`_env`. |
+| `timeout`       | no       | `10s`   | Per-HTTP-request timeout, as a Go duration.                                       |
+| `max_retries`   | no       | `2`     | Extra attempts, with exponential backoff (200ms, 400ms, 800ms, capped at 2s), on a transport error, HTTP 429, or HTTP 5xx. Any other non-2xx response is not retried. |
+| `insecure_http` | no       | `false` | Set to `"true"` to allow `set_url`/`delete_url` to use `http://` instead of `https://`. Local/test use only. |
+
+Both URLs must use `https://` unless `insecure_http` is `"true"`. Headscale
+does not follow a redirect to a different host, or a redirect from `https` to
+`http`, so a compromised or misconfigured webhook cannot be used to leak the
+auth token or HMAC-signed body elsewhere.
+
+### Request
+
+`POST` to `set_url` (or `delete_url` for a deletion), `Content-Type:
+application/json; charset=utf-8`:
+
+```json
+{
+  "action": "set",
+  "zone": "example.com",
+  "type": "TXT",
+  "records": [
+    {
+      "name": "_acme-challenge.node1",
+      "type": "TXT",
+      "value": "gfj9Xq...Rg85nM",
+      "ttl": 120
+    }
+  ]
+}
+```
+
+- `action` is `"set"` for `set_url`, `"delete"` for `delete_url`. It is
+  informational — which endpoint was called already says which operation
+  this is — useful if one backend fronts both URLs.
+- `zone` is `dns.certificates.zone` (or `dns.base_domain`), never trailing-dot
+  qualified.
+- `type` is always `"TXT"`; Headscale never asks this provider for another
+  record type.
+- `records` is the **complete current RRset** for `name`, matching libdns
+  `SetRecords` semantics: it replaces whatever the backend holds for that
+  name, it is not a diff. It normally holds one record; it holds more than
+  one only while two ACME orders for the same node (for example `<node>` and
+  `*.<node>`) are validating concurrently. `name` is relative to `zone`
+  (`"_acme-challenge.node1"`, not the FQDN). `ttl` is whole seconds, `0` when
+  unset.
+- On `delete_url`, `records` holds only the values Headscale is removing
+  (expired challenge values), not the rest of the RRset.
+
+### Response
+
+- Any `2xx` status is success. The response body is ignored.
+- Any other status is a failure. Up to 8 KiB of the response body is read
+  (bounding memory against a runaway backend), and up to 512 bytes of that is
+  kept in the server-side error log. This error is never sent back to the
+  Tailscale client: `SetDNSHandler` (`hscontrol/noise.go`) already returns
+  only a fixed, generic message over the wire and logs full detail
+  server-side only, and the webhook provider's truncation exists so that
+  detail cannot itself balloon the log or echo back a secret from the
+  request.
 
 ## Security properties
 

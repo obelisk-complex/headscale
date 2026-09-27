@@ -87,6 +87,7 @@ type HeadscaleInContainer struct {
 	hostPortBindings map[string][]string
 	aclPolicy        *policyv2.Policy
 	env              map[string]string
+	extraConfigYAML  string
 	tlsCACert        []byte
 	tlsCert          []byte
 	tlsKey           []byte
@@ -148,6 +149,15 @@ func WithCustomTLS(caCert, cert, key []byte) Option {
 func WithConfigEnv(configEnv map[string]string) Option {
 	return func(hsic *HeadscaleInContainer) {
 		maps.Copy(hsic.env, configEnv)
+	}
+}
+
+// WithConfigYAML appends top-level YAML to the config file Headscale starts
+// with. Use it for settings environment variables cannot express, such as
+// maps. It must not repeat a top-level key of [MinimumConfigYAML].
+func WithConfigYAML(configYAML string) Option {
+	return func(hsic *HeadscaleInContainer) {
+		hsic.extraConfigYAML += "\n" + configYAML
 	}
 }
 
@@ -308,10 +318,11 @@ func (hsic *HeadscaleInContainer) buildEntrypoint() []string {
 	// Wait for config.yaml to be written (always written after container start)
 	commands = append(commands, "while [ ! -f /etc/headscale/config.yaml ]; do sleep 0.1; done")
 
-	// If CA certs are configured, wait for them to be written
+	// If CA certs are configured, wait for them to be written; they are
+	// written in order, so the last one marks completion.
 	if len(hsic.caCerts) > 0 {
 		commands = append(commands,
-			fmt.Sprintf("while [ ! -f %s/user-0.crt ]; do sleep 0.1; done", caCertRoot))
+			fmt.Sprintf("while [ ! -f %s/user-%d.crt ]; do sleep 0.1; done", caCertRoot, len(hsic.caCerts)-1))
 	}
 
 	// Update CA certificates
@@ -597,7 +608,7 @@ func New(
 		}
 	}
 
-	err = hsic.WriteFile("/etc/headscale/config.yaml", []byte(MinimumConfigYAML()))
+	err = hsic.WriteFile("/etc/headscale/config.yaml", []byte(MinimumConfigYAML()+hsic.extraConfigYAML))
 	if err != nil {
 		return nil, fmt.Errorf("writing headscale config to container: %w", err)
 	}
