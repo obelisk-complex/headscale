@@ -61,6 +61,10 @@ func TestReadConfig(t *testing.T) {
 					{Name: "prometheus.myvpn.example.com", Type: "A", Value: "100.64.0.4"},
 				},
 				SearchDomains: []string{"test.com", "bar.com"},
+				Certificates: DNSCertificatesConfig{
+					PropagationCheck:   true,
+					PropagationTimeout: 90 * time.Second,
+				},
 			},
 		},
 		{
@@ -127,6 +131,10 @@ func TestReadConfig(t *testing.T) {
 					{Name: "prometheus.myvpn.example.com", Type: "A", Value: "100.64.0.4"},
 				},
 				SearchDomains: []string{"test.com", "bar.com"},
+				Certificates: DNSCertificatesConfig{
+					PropagationCheck:   true,
+					PropagationTimeout: 90 * time.Second,
+				},
 			},
 		},
 		{
@@ -331,6 +339,10 @@ func TestReadConfigFromEnv(t *testing.T) {
 				// 	{Name: "prometheus.myvpn.example.com", Type: "A", Value: "100.64.0.4"},
 				// },
 				SearchDomains: []string{"test.com", "bar.com"},
+				Certificates: DNSCertificatesConfig{
+					PropagationCheck:   true,
+					PropagationTimeout: 90 * time.Second,
+				},
 			},
 		},
 	}
