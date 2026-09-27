@@ -101,6 +101,9 @@ hscontrol.RegisterDNSCertificateProvider("provider-name", func(config map[string
 })
 ```
 
+If the returned value also implements `libdns.RecordDeleter`, Headscale uses
+it to delete expired challenge records (see [Record cleanup](#record-cleanup)).
+
 The factory receives `dns.certificates.provider_config`.
 
 ## Security properties
@@ -108,10 +111,25 @@ The factory receives `dns.certificates.provider_config`.
 - Nodes can only publish `TXT` records.
 - Nodes can only publish `_acme-challenge.<their-node-fqdn>`.
 - The Noise machine key must match the node key in the request.
+- Nodes can only publish a value shaped like an ACME DNS-01 digest (43
+  base64url characters), and expired nodes cannot publish at all.
 - Concurrent TXT values for the same challenge name are preserved in the RRset
-  so overlapping ACME validations do not replace each other.
-- Challenge values are retained in memory only for a short period and then
-  dropped from Headscale's local RRset cache.
+  so overlapping ACME validations (for example `<node>` and `*.<node>`) do not
+  replace each other.
+
+## Record cleanup
+
+Each challenge value stays published for 10 minutes, or for `ttl` if that is
+longer. When it expires Headscale rewrites the RRset without it; when the last
+value for a name expires, Headscale deletes the record if the provider
+implements `libdns.RecordDeleter`.
+
+If the provider only implements `libdns.RecordSetter`, the last value for each
+name stays in the zone until the node's next certificate request replaces it.
+It is harmless (ACME challenge values are single-use), but set a low `ttl` so
+resolvers do not hold it. Pending cleanups are not persisted: values still
+published when Headscale stops are left in the zone and replaced by the next
+request for the same name.
 
 ## Usage
 

@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
+	"maps"
 	"net"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -581,4 +583,194 @@ func TestNetPropagationResolverQueriesPinnedServer(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []string{value}, txts)
 	require.Equal(t, testChallengeFQDN, <-queries)
+}
+
+// fakeRecordStore is a concurrency-safe provider that keeps one zone's TXT
+// records and optionally implements libdns.RecordDeleter.
+type fakeRecordStore struct {
+	mu      sync.Mutex
+	failSet bool
+	rrsets  map[string][]string // relative name -> values
+	deleted []string
+}
+
+func (f *fakeRecordStore) SetRecords(
+	_ context.Context,
+	_ string,
+	records []libdns.Record,
+) ([]libdns.Record, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.failSet {
+		return nil, errors.New("provider down")
+	}
+
+	if f.rrsets == nil {
+		f.rrsets = make(map[string][]string)
+	}
+
+	// libdns SetRecords semantics: the input replaces each (name, type) RRset.
+	byName := make(map[string][]string)
+	for _, r := range records {
+		rr := r.RR()
+		byName[rr.Name] = append(byName[rr.Name], rr.Data)
+	}
+	maps.Copy(f.rrsets, byName)
+
+	return records, nil
+}
+
+func (f *fakeRecordStore) rrset(name string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return slices.Clone(f.rrsets[name])
+}
+
+func (f *fakeRecordStore) setFail(fail bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.failSet = fail
+}
+
+type fakeDeletingRecordStore struct {
+	fakeRecordStore
+}
+
+func (f *fakeDeletingRecordStore) DeleteRecords(
+	_ context.Context,
+	_ string,
+	records []libdns.Record,
+) ([]libdns.Record, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	for _, r := range records {
+		rr := r.RR()
+		f.rrsets[rr.Name] = slices.DeleteFunc(f.rrsets[rr.Name], func(v string) bool {
+			return v == rr.Data
+		})
+		f.deleted = append(f.deleted, rr.Data)
+	}
+
+	return records, nil
+}
+
+func (f *fakeDeletingRecordStore) deletedValues() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return slices.Clone(f.deleted)
+}
+
+func setTestChallenge(t *testing.T, m *dnsCertificateManager, value string) {
+	t.Helper()
+
+	node := testCertNode()
+	require.NoError(t, m.setDNS(t.Context(), node, "example.com", testChallengeRequest(node, value)))
+}
+
+// expireValue backdates value so the next cleanup treats it as expired.
+func expireValue(m *dnsCertificateManager, value string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.records[testChallengeFQDN][value] = time.Now().Add(-time.Second)
+}
+
+func TestDNSCertificateManagerMergesRRset(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeRecordStore{}
+	manager := newDNSCertificateManagerForSetter(types.DNSCertificatesConfig{Zone: "example.com"}, store)
+	v1, v2, v3 := testACMEValue("1"), testACMEValue("2"), testACMEValue("3")
+
+	setTestChallenge(t, manager, v1)
+	setTestChallenge(t, manager, v2)
+	require.ElementsMatch(t, []string{v1, v2}, store.rrset("_acme-challenge.node1"))
+
+	// Re-sending a value does not duplicate it.
+	setTestChallenge(t, manager, v1)
+	require.ElementsMatch(t, []string{v1, v2}, store.rrset("_acme-challenge.node1"))
+
+	// A value the provider rejected is not carried into later writes.
+	store.setFail(true)
+
+	node := testCertNode()
+	require.Error(t, manager.setDNS(t.Context(), node, "example.com", testChallengeRequest(node, v3)))
+	store.setFail(false)
+
+	v4 := testACMEValue("4")
+	setTestChallenge(t, manager, v4)
+	require.ElementsMatch(t, []string{v1, v2, v4}, store.rrset("_acme-challenge.node1"))
+}
+
+func TestDNSCertificateManagerCleanup(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeDeletingRecordStore{}
+	manager := newDNSCertificateManagerForSetter(types.DNSCertificatesConfig{Zone: "example.com"}, store)
+	require.NotNil(t, manager.deleter)
+
+	v1, v2 := testACMEValue("1"), testACMEValue("2")
+	setTestChallenge(t, manager, v1)
+	setTestChallenge(t, manager, v2)
+
+	// One value expired: the RRset is rewritten without it.
+	expireValue(manager, v1)
+	manager.cleanup(testChallengeFQDN)
+	require.Equal(t, []string{v2}, store.rrset("_acme-challenge.node1"))
+	require.Empty(t, store.deletedValues())
+
+	// Last value expired: the record is deleted.
+	expireValue(manager, v2)
+	manager.cleanup(testChallengeFQDN)
+	require.Empty(t, store.rrset("_acme-challenge.node1"))
+	require.Equal(t, []string{v2}, store.deletedValues())
+
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+
+	require.Empty(t, manager.records)
+	require.Empty(t, manager.cleanupTimers)
+}
+
+func TestDNSCertificateManagerCleanupWithoutDeleter(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeRecordStore{}
+	manager := newDNSCertificateManagerForSetter(types.DNSCertificatesConfig{Zone: "example.com"}, store)
+	require.Nil(t, manager.deleter)
+
+	v1 := testACMEValue("1")
+	setTestChallenge(t, manager, v1)
+
+	expireValue(manager, v1)
+	manager.cleanup(testChallengeFQDN)
+
+	// Nothing to delete with, so the record stays; the manager forgets it.
+	require.Equal(t, []string{v1}, store.rrset("_acme-challenge.node1"))
+
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+
+	require.Empty(t, manager.records)
+}
+
+func TestDNSCertificateManagerCleanupTimerFires(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeDeletingRecordStore{}
+	manager := newDNSCertificateManagerForSetter(types.DNSCertificatesConfig{Zone: "example.com"}, store)
+	manager.retention = 20 * time.Millisecond
+
+	v1 := testACMEValue("1")
+	setTestChallenge(t, manager, v1)
+
+	require.Eventually(t, func() bool {
+		return slices.Equal([]string{v1}, store.deletedValues())
+	}, 5*time.Second, 5*time.Millisecond)
+	require.Empty(t, store.rrset("_acme-challenge.node1"))
 }

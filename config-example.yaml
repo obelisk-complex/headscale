@@ -325,7 +325,9 @@ dns:
     provider: ""
     # DNS zone passed to libdns. Empty defaults to dns.base_domain.
     zone: ""
-    # TXT record TTL. Empty or 0 uses the provider default.
+    # TXT record TTL. Empty or 0 uses the provider default. Keep it low:
+    # challenge records are removed after 10 minutes only if the provider
+    # supports deleting records, otherwise the last one per node lingers.
     ttl: 0s
     # The node asks the ACME CA to validate as soon as Headscale answers, so
     # Headscale holds the answer until every authoritative name server of the
