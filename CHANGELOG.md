@@ -68,6 +68,12 @@ Headscale can now advertise per-node certificate domains and handle the
 validates the request belongs to the authenticated node and writes the TXT RRset
 through a registered `libdns` provider.
 
+Headscale answers the node only once every authoritative name server of the
+zone serves the new TXT value (`propagation_check`, `propagation_timeout`), and
+removes expired challenge values afterwards (deleted outright when the provider
+implements `libdns.RecordDeleter`). Provider credentials can be read from files
+or environment variables via `<key>_path` / `<key>_env` in `provider_config`.
+
 Headscale does not run an authoritative DNS server for this feature and does
 not store issued certificates or private keys. A concrete `libdns` provider
 must be registered in the Headscale build and configured under
