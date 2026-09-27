@@ -4,6 +4,9 @@
 //
 // Headscale writes challenge records through its "webhook" DNS provider;
 // [WebhookAdapter] translates those calls into pebble-challtestsrv's API.
+//
+// ACME clients do not talk to Pebble directly but to a TLS proxy in the
+// test process; see [ACMEInContainer.ExtraHost].
 package acmeic
 
 import (
@@ -18,7 +21,10 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/juanfont/headscale/integration/dockertestutil"
@@ -47,6 +53,14 @@ const (
 	// certificates Pebble issues; see [ACMEInContainer.IssuerRoot].
 	pebbleTLSRootPath = "/test/certs/pebble.minica.pem"
 
+	// Pebble's own HTTPS certificate and key, issued for [PebbleHostname];
+	// the proxy presents them so clients see the same server identity.
+	pebbleTLSCertPath = "/test/certs/localhost/cert.pem"
+	pebbleTLSKeyPath  = "/test/certs/localhost/key.pem"
+
+	pebbleOrderPath    = "/my-order/"
+	pebbleFinalizePath = "/finalize-order/"
+
 	acmeicHashLength = 6
 	logDir           = "/tmp/control"
 )
@@ -63,10 +77,14 @@ type ACMEInContainer struct {
 	pebbleIP       string
 	challTestSrvIP string
 	tlsRoot        []byte
+
+	suiteIP string
+	proxy   *http.Server
+	proxyLn net.Listener
 }
 
-// New starts pebble-challtestsrv and Pebble on network and waits until
-// both answer.
+// New starts pebble-challtestsrv and Pebble on network, and the proxy in
+// front of Pebble, and waits until they answer.
 func New(pool *dockertest.Pool, network *dockertest.Network) (*ACMEInContainer, error) {
 	hash := rands.HexString(acmeicHashLength)
 	a := &ACMEInContainer{pool: pool}
@@ -164,21 +182,125 @@ func New(pool *dockertest.Pool, network *dockertest.Network) (*ACMEInContainer, 
 		return nil, fmt.Errorf("waiting for pebble: %w", err)
 	}
 
-	log.Printf("pebble ACME server ready at %s (%s), challtestsrv at %s",
-		a.DirectoryURL(), a.pebbleIP, a.ChallTestSrvURL())
+	err = a.startProxy(network)
+	if err != nil {
+		_ = a.Shutdown()
+
+		return nil, fmt.Errorf("starting pebble proxy: %w", err)
+	}
+
+	log.Printf("pebble ACME server ready at %s (pebble %s, proxy %s), challtestsrv at %s",
+		a.DirectoryURL(), a.pebbleIP, a.suiteIP, a.ChallTestSrvURL())
 
 	return a, nil
 }
 
 // DirectoryURL is the ACME directory URL, for TS_DEBUG_ACME_DIRECTORY_URL.
+// It points at the proxy.
 func (a *ACMEInContainer) DirectoryURL() string {
-	return fmt.Sprintf("https://%s:%d/dir", PebbleHostname, pebbleACMEPort)
+	return "https://" + net.JoinHostPort(PebbleHostname, strconv.Itoa(a.proxyPort())) + "/dir"
 }
 
-// ExtraHost maps [PebbleHostname] to Pebble's address, in the "name:ip"
+// ExtraHost maps [PebbleHostname] to the proxy's address, in the "name:ip"
 // form of a container's extra /etc/hosts entries.
 func (a *ACMEInContainer) ExtraHost() string {
-	return PebbleHostname + ":" + a.pebbleIP
+	return PebbleHostname + ":" + a.suiteIP
+}
+
+func (a *ACMEInContainer) proxyPort() int {
+	return a.proxyLn.Addr().(*net.TCPAddr).Port //nolint:forcetypeassert // net.Listen("tcp") always yields a TCPAddr
+}
+
+// startProxy serves Pebble's ACME API from the test process, adding the
+// Location header Pebble leaves off finalize responses.
+//
+// Pebble always answers finalize with status "processing" and issues the
+// certificate in the background. RFC 8555 section 7.4 has the client poll
+// the order URL until it is "valid", and Pebble sends no Location header
+// with the finalize response. Tailscale's ACME client
+// (tailscale.com/tempfork/acme, CreateOrderCert) takes the order URL to
+// poll from that header only, so it polls "" and fails with
+// `Post "": unsupported protocol scheme ""`.
+//
+// The proxy keeps the client's Host header so the URLs Pebble puts in its
+// responses lead back through the proxy.
+func (a *ACMEInContainer) startProxy(network *dockertest.Network) error {
+	var err error
+
+	a.suiteIP, err = dockertestutil.TestSuiteIPInNetwork(a.pool, network)
+	if err != nil {
+		return err
+	}
+
+	certPEM, err := readFileFromContainer(a.pool, a.pebble, pebbleTLSCertPath)
+	if err != nil {
+		return err
+	}
+
+	keyPEM, err := readFileFromContainer(a.pool, a.pebble, pebbleTLSKeyPath)
+	if err != nil {
+		return err
+	}
+
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return fmt.Errorf("loading pebble TLS certificate: %w", err)
+	}
+
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(a.tlsRoot) {
+		return errors.New("pebble TLS root is not a PEM certificate") //nolint:err113
+	}
+
+	target := &url.URL{
+		Scheme: "https",
+		Host:   net.JoinHostPort(a.pebbleIP, strconv.Itoa(pebbleACMEPort)),
+	}
+
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(r *httputil.ProxyRequest) {
+			r.SetURL(target)
+			r.Out.Host = r.In.Host
+		},
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				RootCAs:    roots,
+				ServerName: PebbleHostname,
+				MinVersion: tls.VersionTLS12,
+			},
+		},
+		ModifyResponse: func(resp *http.Response) error {
+			id, ok := strings.CutPrefix(resp.Request.URL.Path, pebbleFinalizePath)
+			if ok && resp.StatusCode == http.StatusOK && resp.Header.Get("Location") == "" {
+				resp.Header.Set("Location", "https://"+resp.Request.Host+pebbleOrderPath+id)
+			}
+
+			return nil
+		},
+	}
+
+	a.proxyLn, err = net.Listen("tcp", ":0") //nolint:gosec // must be reachable from the Tailscale containers
+	if err != nil {
+		return err
+	}
+
+	a.proxy = &http.Server{
+		Handler:           proxy,
+		ReadHeaderTimeout: 5 * time.Second,
+		TLSConfig: &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		},
+	}
+
+	go func() {
+		err := a.proxy.ServeTLS(a.proxyLn, "", "")
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("pebble proxy stopped: %s", err)
+		}
+	}()
+
+	return nil
 }
 
 // TLSRoot returns the PEM root an ACME client must trust to talk to
@@ -198,9 +320,15 @@ func (a *ACMEInContainer) IssuerRoot() ([]byte, error) {
 	return a.pebbleGet(pebbleManagementPort, "/roots/0")
 }
 
-// Shutdown saves both containers' logs and removes them.
+// Shutdown stops the proxy, saves both containers' logs and removes them.
 func (a *ACMEInContainer) Shutdown() error {
 	var errs []error
+
+	if a.proxy != nil {
+		errs = append(errs, a.proxy.Close())
+	} else if a.proxyLn != nil {
+		errs = append(errs, a.proxyLn.Close())
+	}
 
 	for _, r := range []*dockertest.Resource{a.pebble, a.challTestSrv} {
 		if r == nil {
