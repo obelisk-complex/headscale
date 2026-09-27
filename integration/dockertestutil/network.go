@@ -79,6 +79,38 @@ func GetFirstOrCreateNetworkWithSubnet(pool *dockertest.Pool, name, subnet strin
 	return &networks[0], nil
 }
 
+// TestSuiteContainerName is the name of the container the integration tests
+// run in. It includes the run ID so concurrent runs do not collide.
+func TestSuiteContainerName() string {
+	if runID := GetIntegrationRunID(); runID != "" {
+		return "headscale-test-suite-" + runID
+	}
+
+	return "headscale-test-suite"
+}
+
+// TestSuiteIPInNetwork returns the test suite container's IPv4 address in
+// network, for services the tests run in-process that containers on that
+// network must reach.
+func TestSuiteIPInNetwork(pool *dockertest.Pool, network *dockertest.Network) (string, error) {
+	id, err := lookupContainerID(pool, TestSuiteContainerName())
+	if err != nil {
+		return "", err
+	}
+
+	container, err := pool.Client.InspectContainer(id)
+	if err != nil {
+		return "", fmt.Errorf("inspecting test suite container: %w", err)
+	}
+
+	endpoint, ok := container.NetworkSettings.Networks[network.Network.Name]
+	if !ok || endpoint.IPAddress == "" {
+		return "", fmt.Errorf("test suite container is not attached to network %s", network.Network.Name) //nolint:err113
+	}
+
+	return endpoint.IPAddress, nil
+}
+
 func AddContainerToNetwork(
 	pool *dockertest.Pool,
 	network *dockertest.Network,

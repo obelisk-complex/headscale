@@ -297,12 +297,7 @@ func (s *Scenario) AddNetworkWithSubnet(name, subnet string) (*dockertest.Networ
 	// readiness checks, this ensures that we can run the tests with individual networks
 	// and have the client reach the different containers.
 	// The container name includes the run ID to support multiple concurrent test runs.
-	testSuiteName := "headscale-test-suite"
-	if runID := dockertestutil.GetIntegrationRunID(); runID != "" {
-		testSuiteName = "headscale-test-suite-" + runID
-	}
-
-	err = dockertestutil.AddContainerToNetwork(s.pool, network, testSuiteName)
+	err = dockertestutil.AddContainerToNetwork(s.pool, network, dockertestutil.TestSuiteContainerName())
 	if err != nil {
 		return nil, fmt.Errorf("adding test suite container to network: %w", err)
 	}

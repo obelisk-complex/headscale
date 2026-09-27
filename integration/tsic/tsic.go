@@ -103,6 +103,7 @@ type TailscaleInContainer struct {
 	withTags          []string
 	withEntrypoint    []string
 	withExtraHosts    []string
+	withEnv           []string
 	workdir           string
 	netfilter         string
 	extraLoginArgs    []string
@@ -187,9 +188,23 @@ func WithDockerWorkdir(dir string) Option {
 	}
 }
 
+// WithExtraHosts adds "name:ip" entries to the container's /etc/hosts.
+// Repeated options accumulate; an entry already present is not added twice.
 func WithExtraHosts(hosts []string) Option {
 	return func(tsic *TailscaleInContainer) {
-		tsic.withExtraHosts = hosts
+		for _, host := range hosts {
+			if !slices.Contains(tsic.withExtraHosts, host) {
+				tsic.withExtraHosts = append(tsic.withExtraHosts, host)
+			}
+		}
+	}
+}
+
+// WithEnv sets KEY=value environment variables for tailscaled, such as
+// the TS_DEBUG_* knobs.
+func WithEnv(env ...string) Option {
+	return func(tsic *TailscaleInContainer) {
+		tsic.withEnv = append(tsic.withEnv, env...)
 	}
 }
 
@@ -285,10 +300,11 @@ func (t *TailscaleInContainer) buildEntrypoint() []string {
 	commands = append(commands, "while ! ip route show default >/dev/null 2>&1; do sleep 0.1; done")
 
 	// If CA certs are configured, wait for them to be written by the Go code
-	// (certs are written after container start via [TailscaleInContainer.WriteFile])
+	// (certs are written in order after container start via
+	// [TailscaleInContainer.WriteFile], so the last one marks completion).
 	if len(t.caCerts) > 0 {
 		commands = append(commands,
-			fmt.Sprintf("while [ ! -f %s/user-0.crt ]; do sleep 0.1; done", caCertRoot))
+			fmt.Sprintf("while [ ! -f %s/user-%d.crt ]; do sleep 0.1; done", caCertRoot, len(t.caCerts)-1))
 	}
 
 	// Install packages if requested (requires internet access)
@@ -371,7 +387,7 @@ func New(
 		Networks:   []*dockertest.Network{tsic.network},
 		Entrypoint: tsic.withEntrypoint,
 		ExtraHosts: tsic.withExtraHosts,
-		Env:        []string{},
+		Env:        slices.Clone(tsic.withEnv),
 	}
 
 	if tsic.withWebsocketDERP {
