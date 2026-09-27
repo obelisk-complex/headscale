@@ -4,9 +4,11 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"net/netip"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -177,8 +179,10 @@ type DNSCertificatesConfig struct {
 	// factory that returns a libdns.RecordSetter.
 	Provider string
 
-	// ProviderConfig is passed unchanged to the registered provider factory.
-	ProviderConfig map[string]string `mapstructure:"provider_config" json:"-"`
+	// ProviderConfig is passed to the registered provider factory after
+	// "<key>_path" and "<key>_env" entries are resolved into "<key>" (see
+	// resolveDNSProviderSecrets).
+	ProviderConfig DNSProviderConfig `mapstructure:"provider_config" json:"-"`
 
 	// Zone is the DNS zone passed to libdns. Empty defaults to dns.base_domain.
 	Zone string
@@ -199,6 +203,116 @@ type DNSCertificatesConfig struct {
 	// the TXT record and the SetDNS response. With PropagationCheck off it
 	// is the only propagation allowance.
 	PropagationWait time.Duration `mapstructure:"propagation_wait"`
+}
+
+// DNSProviderConfig holds DNS provider settings, which usually include API
+// credentials. String and GoString print only the keys, so debug output such
+// as HEADSCALE_DEBUG_DUMP_CONFIG (spew honours fmt.Stringer) and %v/%#v
+// formatting never show the values.
+type DNSProviderConfig map[string]string
+
+func (c DNSProviderConfig) String() string {
+	keys := slices.Sorted(maps.Keys(c))
+	for i, k := range keys {
+		keys[i] = k + ":<redacted>"
+	}
+
+	return "map[" + strings.Join(keys, " ") + "]"
+}
+
+func (c DNSProviderConfig) GoString() string {
+	return "types.DNSProviderConfig" + c.String()
+}
+
+// Suffixes of dns.certificates.provider_config keys whose value names where
+// the secret lives rather than holding it, mirroring oidc.client_secret_path.
+const (
+	secretPathSuffix = "_path"
+	secretEnvSuffix  = "_env"
+)
+
+// resolveDNSProviderSecrets replaces "<key>_path" entries with "<key>" set
+// to the trimmed contents of that file (environment variables in the path
+// are expanded) and "<key>_env" entries with "<key>" set to that
+// environment variable. A key may be given in only one of the three forms.
+// Error details name keys, paths and variables, never secret values.
+func resolveDNSProviderSecrets(raw map[string]string) (DNSProviderConfig, []*ConfigError) {
+	const prefix = "dns.certificates.provider_config."
+
+	if len(raw) == 0 {
+		return nil, nil
+	}
+
+	resolved := make(DNSProviderConfig, len(raw))
+	source := make(map[string]string, len(raw))
+
+	var errs []*ConfigError
+
+	for _, key := range slices.Sorted(maps.Keys(raw)) {
+		ref := raw[key]
+		name, value := key, ref
+
+		switch {
+		case strings.HasSuffix(key, secretPathSuffix) && len(key) > len(secretPathSuffix):
+			name = strings.TrimSuffix(key, secretPathSuffix)
+			path := os.ExpandEnv(ref)
+
+			content, err := os.ReadFile(path)
+			if err != nil {
+				errs = append(errs, &ConfigError{
+					Reason:  prefix + key + " cannot be read",
+					Current: []KV{{prefix + key, ref}},
+					Detail:  err.Error(),
+					Hint:    "ensure the file exists and is readable by the headscale user",
+					Cause:   err,
+				})
+
+				continue
+			}
+
+			value = strings.TrimSpace(string(content))
+
+		case strings.HasSuffix(key, secretEnvSuffix) && len(key) > len(secretEnvSuffix):
+			name = strings.TrimSuffix(key, secretEnvSuffix)
+
+			env, ok := os.LookupEnv(ref)
+			if !ok {
+				errs = append(errs, &ConfigError{
+					Reason:  prefix + key + " names an unset environment variable",
+					Current: []KV{{prefix + key, ref}},
+					Hint:    "export the variable in headscale's environment",
+				})
+
+				continue
+			}
+
+			value = strings.TrimSpace(env)
+		}
+
+		if other, dup := source[name]; dup {
+			errs = append(errs, &ConfigError{
+				Reason:  prefix + name + " is set more than once",
+				Current: []KV{{prefix + other, "<set>"}, {prefix + key, "<set>"}},
+				Hint:    "keep one of " + name + ", " + name + secretPathSuffix + " or " + name + secretEnvSuffix,
+			})
+
+			continue
+		}
+
+		if value == "" && name != key {
+			errs = append(errs, &ConfigError{
+				Reason:  prefix + key + " resolves to an empty value",
+				Current: []KV{{prefix + key, ref}},
+			})
+
+			continue
+		}
+
+		source[name] = key
+		resolved[name] = value
+	}
+
+	return resolved, errs
 }
 
 type Nameservers struct {
@@ -1487,6 +1601,13 @@ func LoadServerConfig() (*Config, error) {
 				},
 			})
 		}
+
+		providerConfig, errs := resolveDNSProviderSecrets(dnsConfig.Certificates.ProviderConfig)
+		for _, err := range errs {
+			v.Add(err)
+		}
+
+		dnsConfig.Certificates.ProviderConfig = providerConfig
 
 		zone := strings.ToLower(strings.TrimSuffix(dnsConfig.Certificates.Zone, "."))
 		base := strings.ToLower(strings.TrimSuffix(dnsConfig.BaseDomain, "."))

@@ -342,8 +342,18 @@ dns:
     # Minimum time between the provider accepting the record and Headscale
     # answering the node, on top of propagation_check.
     propagation_wait: 0s
-    # Provider-specific settings passed unchanged to the registered provider
-    # factory. Exact keys depend on the provider package used in your build.
+    # Provider-specific settings passed to the registered provider factory.
+    # Exact keys depend on the provider package used in your build.
+    #
+    # Keep credentials out of this file: `<key>_path` reads `<key>` from a
+    # file (environment variables in the path are expanded, trailing
+    # whitespace is trimmed) and `<key>_env` reads it from an environment
+    # variable. The provider receives `<key>`. Values are redacted from
+    # HEADSCALE_DEBUG_DUMP_CONFIG output.
+    #
+    # provider_config:
+    #   api_token_path: /run/secrets/dns_api_token
+    #   api_token_env: DNS_API_TOKEN
     provider_config: {}
 
   # Whether to use the local DNS settings of a node or override the local DNS

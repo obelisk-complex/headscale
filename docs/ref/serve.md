@@ -48,7 +48,7 @@ dns:
     propagation_timeout: 90s
     propagation_wait: 0s
     provider_config:
-      token: "provider-api-token"
+      token_path: /run/secrets/dns_provider_token
 ```
 
 `dns.certificates.enabled` requires:
@@ -58,9 +58,22 @@ dns:
 - `dns.certificates.provider` set
 - a Headscale build that registers a matching `libdns` provider factory
 
-`zone` defaults to `dns.base_domain` when empty. `provider_config` is passed
-unchanged to the registered provider factory and is omitted from JSON debug
-configuration output because it commonly contains API credentials.
+`zone` defaults to `dns.base_domain` when empty, and must contain
+`dns.base_domain`.
+
+`provider_config` usually carries API credentials. Rather than writing them
+into the configuration file, give any key as:
+
+- `<key>_path`: a file holding the value (for example a systemd credential or
+  container secret). Environment variables in the path are expanded and
+  surrounding whitespace is trimmed, as for `oidc.client_secret_path`.
+- `<key>_env`: the name of an environment variable holding the value.
+
+Headscale resolves these at startup and hands the provider `<key>`; setting a
+key in more than one form is a configuration error. As a consequence a provider
+cannot receive a key that itself ends in `_path` or `_env`. `provider_config`
+values are omitted from JSON output and redacted from
+`HEADSCALE_DEBUG_DUMP_CONFIG` dumps.
 
 ## Propagation
 

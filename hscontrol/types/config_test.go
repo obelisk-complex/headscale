@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/davecgh/go-spew/spew"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/spf13/viper"
@@ -749,6 +750,28 @@ func TestDNSCertificateConfig(t *testing.T) {
 			wantErr: "dns.certificates.enabled requires dns.certificates.provider to be set",
 		},
 		{
+			name: "provider-config-secret-from-env",
+			dnsYAML: `
+  magic_dns: true
+  base_domain: example.com
+  override_local_dns: false
+  certificates:
+    enabled: true
+    provider: test-provider
+    provider_config:
+      token_env: HS_TEST_DNS_CONFIG_TOKEN
+      zone_id: z1
+`,
+			want: DNSCertificatesConfig{
+				Enabled:            true,
+				Provider:           "test-provider",
+				ProviderConfig:     DNSProviderConfig{"token": "env-token", "zone_id": "z1"},
+				Zone:               "example.com",
+				PropagationCheck:   true,
+				PropagationTimeout: 90 * time.Second,
+			},
+		},
+		{
 			name: "propagation-check-disabled",
 			dnsYAML: `
   magic_dns: true
@@ -810,6 +833,8 @@ func TestDNSCertificateConfig(t *testing.T) {
 			wantErr: "dns.base_domain must be dns.certificates.zone or a subdomain of it",
 		},
 	}
+
+	t.Setenv("HS_TEST_DNS_CONFIG_TOKEN", "env-token")
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1001,6 +1026,114 @@ func TestConfigJSONOmitsSecrets(t *testing.T) {
 	} {
 		assert.NotContains(t, body, secret,
 			"marshalled Config must not contain secret %q", secret)
+	}
+}
+
+// TestDNSProviderConfigRedactedInDebugOutput covers HEADSCALE_DEBUG_DUMP_CONFIG,
+// which spew-dumps the whole Config, and ordinary %v/%+v/%#v formatting.
+func TestDNSProviderConfigRedactedInDebugOutput(t *testing.T) {
+	const secret = "dns-provider-secret-marker" //nolint:gosec // test marker, not a real credential
+
+	cfg := &Config{
+		DNSConfig: DNSConfig{
+			Certificates: DNSCertificatesConfig{
+				ProviderConfig: DNSProviderConfig{"token": secret, "zone_id": secret},
+			},
+		},
+	}
+
+	for name, out := range map[string]string{
+		"spew":  spew.Sdump(cfg),
+		"%v":    fmt.Sprintf("%v", cfg.DNSConfig),
+		"%+v":   fmt.Sprintf("%+v", cfg.DNSConfig),
+		"%#v":   fmt.Sprintf("%#v", cfg.DNSConfig),
+		"field": fmt.Sprint(cfg.DNSConfig.Certificates.ProviderConfig),
+	} {
+		assert.NotContains(t, out, secret, "%s output leaks the provider secret", name)
+		assert.Contains(t, out, "token:<redacted>", "%s output should still name the keys", name)
+	}
+}
+
+func TestResolveDNSProviderSecrets(t *testing.T) {
+	dir := t.TempDir()
+	secretFile := filepath.Join(dir, "token")
+	require.NoError(t, os.WriteFile(secretFile, []byte("file-secret\n"), 0o600))
+	emptyFile := filepath.Join(dir, "empty")
+	require.NoError(t, os.WriteFile(emptyFile, []byte("\n"), 0o600))
+
+	t.Setenv("HS_TEST_DNS_TOKEN", "env-secret")
+	t.Setenv("HS_TEST_DNS_DIR", dir)
+
+	tests := []struct {
+		name    string
+		raw     map[string]string
+		want    DNSProviderConfig
+		wantErr string
+	}{
+		{
+			name: "plain-values-pass-through",
+			raw:  map[string]string{"token": "inline", "zone_id": "z1"},
+			want: DNSProviderConfig{"token": "inline", "zone_id": "z1"},
+		},
+		{
+			name: "path",
+			raw:  map[string]string{"token_path": secretFile, "zone_id": "z1"},
+			want: DNSProviderConfig{"token": "file-secret", "zone_id": "z1"},
+		},
+		{
+			name: "path-expands-env",
+			raw:  map[string]string{"token_path": "${HS_TEST_DNS_DIR}/token"},
+			want: DNSProviderConfig{"token": "file-secret"},
+		},
+		{
+			name: "env",
+			raw:  map[string]string{"token_env": "HS_TEST_DNS_TOKEN"},
+			want: DNSProviderConfig{"token": "env-secret"},
+		},
+		{
+			name:    "missing-file",
+			raw:     map[string]string{"token_path": filepath.Join(dir, "nope")},
+			wantErr: "dns.certificates.provider_config.token_path cannot be read",
+		},
+		{
+			name:    "empty-file",
+			raw:     map[string]string{"token_path": emptyFile},
+			wantErr: "dns.certificates.provider_config.token_path resolves to an empty value",
+		},
+		{
+			name:    "unset-env",
+			raw:     map[string]string{"token_env": "HS_TEST_DNS_UNSET"},
+			wantErr: "dns.certificates.provider_config.token_env names an unset environment variable",
+		},
+		{
+			name:    "inline-and-path",
+			raw:     map[string]string{"token": "inline", "token_path": secretFile},
+			wantErr: "dns.certificates.provider_config.token is set more than once",
+		},
+		{
+			name:    "path-and-env",
+			raw:     map[string]string{"token_env": "HS_TEST_DNS_TOKEN", "token_path": secretFile},
+			wantErr: "dns.certificates.provider_config.token is set more than once",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, errs := resolveDNSProviderSecrets(tt.raw)
+			if tt.wantErr == "" {
+				require.Empty(t, errs)
+				assert.Equal(t, tt.want, got)
+
+				return
+			}
+
+			require.Len(t, errs, 1)
+			assert.Contains(t, errs[0].Error(), tt.wantErr)
+
+			for _, secret := range []string{"file-secret", "env-secret", "inline"} {
+				assert.NotContains(t, errs[0].Error(), secret, "config errors must not echo secrets")
+			}
+		})
 	}
 }
 
