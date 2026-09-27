@@ -92,6 +92,8 @@ dns:
 			tsic.WithEnv("TS_DEBUG_ACME_DIRECTORY_URL=" + acme.DirectoryURL()),
 			tsic.WithCACert(acme.TLSRoot()),
 			tsic.WithExtraHosts([]string{acme.ExtraHost()}),
+			// The tailscale images ship without curl.
+			tsic.WithPackages("curl"),
 		},
 		hsic.WithTestName("dnscert"),
 		hsic.WithConfigYAML(certConfig),
