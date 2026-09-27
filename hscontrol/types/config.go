@@ -1453,6 +1453,20 @@ func LoadServerConfig() (*Config, error) {
 		if dnsConfig.Certificates.Zone == "" {
 			dnsConfig.Certificates.Zone = dnsConfig.BaseDomain
 		}
+
+		zone := strings.ToLower(strings.TrimSuffix(dnsConfig.Certificates.Zone, "."))
+		base := strings.ToLower(strings.TrimSuffix(dnsConfig.BaseDomain, "."))
+
+		if base != "" && base != zone && !strings.HasSuffix(base, "."+zone) {
+			v.Add(&ConfigError{
+				Reason: "dns.base_domain must be dns.certificates.zone or a subdomain of it",
+				Current: []KV{
+					{"dns.base_domain", dnsConfig.BaseDomain},
+					{"dns.certificates.zone", dnsConfig.Certificates.Zone},
+				},
+				Hint: "set dns.certificates.zone to the DNS zone that contains dns.base_domain",
+			})
+		}
 	}
 
 	err = v.Err()

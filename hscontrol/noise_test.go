@@ -5,13 +5,13 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
@@ -404,61 +404,10 @@ func TestOverrideRemoteAddr(t *testing.T) {
 	assert.Equal(t, clientAddr, observed)
 }
 
-func TestSetDNSHandlerPublishesTXTRecord(t *testing.T) {
-	t.Parallel()
-
-	app := createTestApp(t)
-	user := app.state.CreateUserForTest("cert-user")
-	node := putTestNodeInStore(t, app, user, "cert-node")
-	node.GivenName = "cert-node"
-	app.state.PutNodeInStoreForTest(*node)
-	app.cfg.BaseDomain = "example.com"
-	fqdn, err := node.GetFQDN(app.cfg.BaseDomain)
-	require.NoError(t, err)
-	challengeName := "_acme-challenge." + strings.TrimSuffix(fqdn, ".")
-
-	setter := &fakeRecordSetter{}
-	app.dnsCertManager = newDNSCertificateManagerForSetter(types.DNSCertificatesConfig{
-		Zone: "example.com",
-	}, setter)
-
-	ns := &noiseServer{
-		headscale:  app,
-		machineKey: node.MachineKey,
-	}
-
-	reqBody := tailcfg.SetDNSRequest{
-		Version: tailcfg.CurrentCapabilityVersion,
-		NodeKey: node.NodeKey,
-		Name:    challengeName,
-		Type:    "TXT",
-		Value:   "challenge-token",
-	}
-	payload, err := json.Marshal(reqBody)
-	require.NoError(t, err)
-
-	req := httptest.NewRequestWithContext(
-		context.Background(),
-		http.MethodPost,
-		"/machine/set-dns",
-		bytes.NewReader(payload),
-	)
-	rec := httptest.NewRecorder()
-
-	ns.SetDNSHandler(rec, req)
-
-	require.Equal(t, http.StatusOK, rec.Code, "body=%s", rec.Body.String())
-	require.Equal(t, "example.com", setter.zone)
-	require.Len(t, setter.records, 1)
-
-	txt, ok := setter.records[0].(libdns.TXT)
-	require.True(t, ok, "record = %T, want libdns.TXT", setter.records[0])
-	require.Equal(t, strings.TrimSuffix(challengeName, ".example.com"), txt.Name)
-	require.Equal(t, "challenge-token", txt.Text)
-}
-
-func TestSetDNSHandlerRejectsOtherNodeRecord(t *testing.T) {
-	t.Parallel()
+// setDNSTestApp returns an app with DNS certificates enabled through setter
+// and one node, "cert-node", registered to the returned node's machine key.
+func setDNSTestApp(t *testing.T, setter libdns.RecordSetter) (*Headscale, *types.Node) {
+	t.Helper()
 
 	app := createTestApp(t)
 	user := app.state.CreateUserForTest("cert-user")
@@ -468,22 +417,21 @@ func TestSetDNSHandlerRejectsOtherNodeRecord(t *testing.T) {
 	app.cfg.BaseDomain = "example.com"
 	app.dnsCertManager = newDNSCertificateManagerForSetter(
 		types.DNSCertificatesConfig{Zone: "example.com"},
-		&fakeRecordSetter{},
+		setter,
 	)
 
-	ns := &noiseServer{
-		headscale:  app,
-		machineKey: node.MachineKey,
-	}
+	return app, node
+}
 
-	reqBody := tailcfg.SetDNSRequest{
-		Version: tailcfg.CurrentCapabilityVersion,
-		NodeKey: node.NodeKey,
-		Name:    "_acme-challenge.other.example.com",
-		Type:    "TXT",
-		Value:   "challenge-token",
-	}
-	payload, err := json.Marshal(reqBody)
+func doSetDNS(
+	t *testing.T,
+	app *Headscale,
+	machineKey key.MachinePublic,
+	dnsReq tailcfg.SetDNSRequest,
+) *httptest.ResponseRecorder {
+	t.Helper()
+
+	payload, err := json.Marshal(dnsReq)
 	require.NoError(t, err)
 
 	req := httptest.NewRequestWithContext(
@@ -494,9 +442,158 @@ func TestSetDNSHandlerRejectsOtherNodeRecord(t *testing.T) {
 	)
 	rec := httptest.NewRecorder()
 
+	ns := &noiseServer{headscale: app, machineKey: machineKey}
 	ns.SetDNSHandler(rec, req)
 
-	require.Equal(t, http.StatusBadRequest, rec.Code)
+	return rec
+}
+
+func TestSetDNSHandlerPublishesTXTRecord(t *testing.T) {
+	t.Parallel()
+
+	setter := &fakeRecordSetter{}
+	app, node := setDNSTestApp(t, setter)
+
+	// tailscaled hardcodes Version 1 in SetDNSRequest; it must be accepted.
+	rec := doSetDNS(t, app, node.MachineKey, tailcfg.SetDNSRequest{
+		Version: 1,
+		NodeKey: node.NodeKey,
+		Name:    "_acme-challenge.cert-node.example.com",
+		Type:    "TXT",
+		Value:   testACMEValue("challenge"),
+	})
+
+	require.Equal(t, http.StatusOK, rec.Code, "body=%s", rec.Body.String())
+	require.Equal(t, "example.com", setter.zone)
+	require.Len(t, setter.records, 1)
+
+	txt, ok := setter.records[0].(libdns.TXT)
+	require.True(t, ok, "record = %T, want libdns.TXT", setter.records[0])
+	require.Equal(t, "_acme-challenge.cert-node", txt.Name)
+	require.Equal(t, testACMEValue("challenge"), txt.Text)
+}
+
+func TestSetDNSHandlerRejects(t *testing.T) {
+	t.Parallel()
+
+	expired := time.Now().Add(-time.Hour)
+
+	tests := []struct {
+		name     string
+		mutate   func(app *Headscale, node *types.Node) (key.MachinePublic, tailcfg.SetDNSRequest)
+		wantCode int
+	}{
+		{
+			name: "other-node-record",
+			mutate: func(_ *Headscale, node *types.Node) (key.MachinePublic, tailcfg.SetDNSRequest) {
+				return node.MachineKey, tailcfg.SetDNSRequest{
+					NodeKey: node.NodeKey,
+					Name:    "_acme-challenge.other.example.com",
+					Type:    "TXT",
+					Value:   testACMEValue("challenge"),
+				}
+			},
+			wantCode: http.StatusBadRequest,
+		},
+		{
+			name: "non-txt-record",
+			mutate: func(_ *Headscale, node *types.Node) (key.MachinePublic, tailcfg.SetDNSRequest) {
+				return node.MachineKey, tailcfg.SetDNSRequest{
+					NodeKey: node.NodeKey,
+					Name:    "_acme-challenge.cert-node.example.com",
+					Type:    "CNAME",
+					Value:   "evil.example.net",
+				}
+			},
+			wantCode: http.StatusBadRequest,
+		},
+		{
+			// A machine may not act for a node registered to another
+			// machine, even when it knows that node's public key.
+			name: "foreign-machine-key",
+			mutate: func(_ *Headscale, node *types.Node) (key.MachinePublic, tailcfg.SetDNSRequest) {
+				return key.NewMachine().Public(), tailcfg.SetDNSRequest{
+					NodeKey: node.NodeKey,
+					Name:    "_acme-challenge.cert-node.example.com",
+					Type:    "TXT",
+					Value:   testACMEValue("challenge"),
+				}
+			},
+			wantCode: http.StatusNotFound,
+		},
+		{
+			name: "unknown-node-key",
+			mutate: func(_ *Headscale, node *types.Node) (key.MachinePublic, tailcfg.SetDNSRequest) {
+				return node.MachineKey, tailcfg.SetDNSRequest{
+					NodeKey: key.NewNode().Public(),
+					Name:    "_acme-challenge.cert-node.example.com",
+					Type:    "TXT",
+					Value:   testACMEValue("challenge"),
+				}
+			},
+			wantCode: http.StatusNotFound,
+		},
+		{
+			name: "expired-node",
+			mutate: func(app *Headscale, node *types.Node) (key.MachinePublic, tailcfg.SetDNSRequest) {
+				node.Expiry = &expired
+				app.state.PutNodeInStoreForTest(*node)
+
+				return node.MachineKey, tailcfg.SetDNSRequest{
+					NodeKey: node.NodeKey,
+					Name:    "_acme-challenge.cert-node.example.com",
+					Type:    "TXT",
+					Value:   testACMEValue("challenge"),
+				}
+			},
+			wantCode: http.StatusForbidden,
+		},
+		{
+			name: "certificates-disabled",
+			mutate: func(app *Headscale, node *types.Node) (key.MachinePublic, tailcfg.SetDNSRequest) {
+				app.dnsCertManager = nil
+
+				return node.MachineKey, tailcfg.SetDNSRequest{
+					NodeKey: node.NodeKey,
+					Name:    "_acme-challenge.cert-node.example.com",
+					Type:    "TXT",
+					Value:   testACMEValue("challenge"),
+				}
+			},
+			wantCode: http.StatusNotImplemented,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			setter := &fakeRecordSetter{}
+			app, node := setDNSTestApp(t, setter)
+			machineKey, dnsReq := tt.mutate(app, node)
+
+			rec := doSetDNS(t, app, machineKey, dnsReq)
+
+			require.Equal(t, tt.wantCode, rec.Code, "body=%s", rec.Body.String())
+			require.Nil(t, setter.records, "no record may be written")
+		})
+	}
+}
+
+func TestSetDNSHandlerProviderFailureIsBadGateway(t *testing.T) {
+	t.Parallel()
+
+	app, node := setDNSTestApp(t, &fakeRecordSetter{err: errors.New("provider down")})
+
+	rec := doSetDNS(t, app, node.MachineKey, tailcfg.SetDNSRequest{
+		NodeKey: node.NodeKey,
+		Name:    "_acme-challenge.cert-node.example.com",
+		Type:    "TXT",
+		Value:   testACMEValue("challenge"),
+	})
+
+	require.Equal(t, http.StatusBadGateway, rec.Code, "body=%s", rec.Body.String())
+	require.NotContains(t, rec.Body.String(), "provider down", "provider errors stay in the server log")
 }
 
 // TestSSHActionHoldAndDelegate_PersistsAuthSession guards the happy path: the

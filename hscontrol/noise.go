@@ -16,6 +16,7 @@ import (
 	"github.com/go-chi/metrics"
 	"github.com/juanfont/headscale/hscontrol/capver"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/util/zlog/zf"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/net/http2"
@@ -852,10 +853,10 @@ func (ns *noiseServer) SetDNSHandler(writer http.ResponseWriter, req *http.Reque
 		return
 	}
 
-	if rejectUnsupported(writer, dnsReq.Version, ns.machineKey, dnsReq.NodeKey) {
-		return
-	}
-
+	// SetDNSRequest.Version is not gated with rejectUnsupported: tailscaled
+	// hardcodes Version 1 for this request regardless of its capability
+	// version. The caller is authenticated by the Noise session instead: the
+	// NodeKey must belong to a node registered to this session's MachineKey.
 	nv, err := ns.getAndValidateNode(dnsReq.NodeKey)
 	if err != nil {
 		httpError(writer, err)
@@ -863,16 +864,33 @@ func (ns *noiseServer) SetDNSHandler(writer http.ResponseWriter, req *http.Reque
 		return
 	}
 
-	if err := ns.headscale.dnsCertManager.setDNS(
+	if nv.IsExpired() {
+		httpError(writer, NewHTTPError(http.StatusForbidden, "node is expired", nil))
+
+		return
+	}
+
+	err = ns.headscale.dnsCertManager.setDNS(
 		req.Context(),
 		nv,
 		ns.headscale.cfg.BaseDomain,
 		dnsReq,
-	); err != nil {
-		httpError(writer, NewHTTPError(http.StatusBadRequest, "invalid DNS record update", err))
+	)
+	if err != nil {
+		code, msg := http.StatusBadGateway, "publishing DNS record failed"
+		if isSetDNSRequestError(err) {
+			code, msg = http.StatusBadRequest, "invalid DNS record update"
+		}
+
+		httpError(writer, NewHTTPError(code, msg, err))
 
 		return
 	}
+
+	log.Info().
+		Uint64(zf.NodeID, nv.ID().Uint64()).
+		Str("dns.name", dnsReq.Name).
+		Msg("published ACME DNS-01 challenge record")
 
 	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
 	writer.WriteHeader(http.StatusOK)

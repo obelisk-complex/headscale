@@ -447,6 +447,8 @@ oidc:
 	assert.Contains(t, err.Error(), errInvalidPKCEMethod.Error())
 }
 
+// TestOIDCConfigValidation covers the issuer-URL and required-field checks that
+// fail an unworkable OIDC setup fast at config load.
 func TestOIDCConfigValidation(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -743,6 +745,32 @@ func TestDNSCertificateConfig(t *testing.T) {
     enabled: true
 `,
 			wantErr: "dns.certificates.enabled requires dns.certificates.provider to be set",
+		},
+		{
+			name: "base-domain-outside-zone",
+			dnsYAML: `
+  magic_dns: true
+  base_domain: ts.example.com
+  override_local_dns: false
+  certificates:
+    enabled: true
+    provider: test-provider
+    zone: example.org
+`,
+			wantErr: "dns.base_domain must be dns.certificates.zone or a subdomain of it",
+		},
+		{
+			name: "base-domain-suffix-is-not-subdomain",
+			dnsYAML: `
+  magic_dns: true
+  base_domain: badexample.com
+  override_local_dns: false
+  certificates:
+    enabled: true
+    provider: test-provider
+    zone: example.com
+`,
+			wantErr: "dns.base_domain must be dns.certificates.zone or a subdomain of it",
 		},
 	}
 
