@@ -276,7 +276,11 @@ dns:
 Both URLs must use `https://` unless `insecure_http` is `"true"`. Headscale
 does not follow a redirect to a different host, or a redirect from `https` to
 `http`, so a compromised or misconfigured webhook cannot be used to leak the
-auth token or HMAC-signed body elsewhere.
+auth token or HMAC-signed body elsewhere. It follows only `307` and `308`
+redirects, which resend the `POST` with its body; a `301`, `302` or `303`
+would turn the request into a bodyless `GET`, so it fails the write (and is
+not retried) instead of taking that `GET`'s response as the record having
+been written. Point the URLs at the final endpoint.
 
 ### Request
 

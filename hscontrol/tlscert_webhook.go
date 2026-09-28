@@ -225,23 +225,44 @@ type webhookProvider struct {
 	client *http.Client
 }
 
+// errWebhookRedirect marks a redirect the webhook client refused to follow.
+// A redirect on an operator-configured URL is a misconfiguration, so it is
+// not retried.
+var errWebhookRedirect = errors.New("webhook: refusing redirect")
+
 // webhookCheckRedirect allows a webhook to redirect only to the same host it
-// was called on, and never downgrades https to http. The webhook target is
+// was called on, only when the redirect keeps the POST and its body (307 or
+// 308), and never downgrades https to http. The webhook target is
 // operator-configured rather than attacker-controlled, but a redirect
 // followed blindly would let a compromised or misconfigured webhook send
-// Headscale's auth token or HMAC-signed body to an arbitrary host.
+// Headscale's auth token or HMAC-signed body to an arbitrary host, and a
+// 301/302/303 turns the POST into a bodyless GET whose 2xx would be taken as
+// the record having been written.
 func webhookCheckRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) >= dnsWebhookMaxRedirects {
-		return fmt.Errorf("webhook: stopped after %d redirects", dnsWebhookMaxRedirects)
+		return fmt.Errorf("%w: stopped after %d redirects", errWebhookRedirect, dnsWebhookMaxRedirects)
+	}
+
+	prev := via[len(via)-1]
+	if req.Method != prev.Method {
+		code := 0
+		if req.Response != nil {
+			code = req.Response.StatusCode
+		}
+
+		return fmt.Errorf(
+			"%w: %d redirect would change %s to %s and drop the body; use 307 or 308",
+			errWebhookRedirect, code, prev.Method, req.Method,
+		)
 	}
 
 	first := via[0].URL
 	if req.URL.Host != first.Host {
-		return fmt.Errorf("webhook: refusing to follow redirect to different host %q", req.URL.Host)
+		return fmt.Errorf("%w: different host %q", errWebhookRedirect, req.URL.Host)
 	}
 
 	if first.Scheme == "https" && req.URL.Scheme != "https" {
-		return errors.New("webhook: refusing to follow redirect from https to a non-https URL")
+		return fmt.Errorf("%w: https to a non-https URL", errWebhookRedirect)
 	}
 
 	return nil
@@ -386,7 +407,8 @@ func (e *webhookStatusError) retryable() bool {
 }
 
 func isWebhookRetryable(err error) bool {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, errWebhookRedirect) {
 		return false
 	}
 

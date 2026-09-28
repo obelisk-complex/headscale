@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -341,7 +342,7 @@ func TestWebhookRefusesRedirectToDifferentHost(t *testing.T) {
 	defer other.Close()
 
 	redirecting := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, other.URL+"/set", http.StatusFound)
+		http.Redirect(w, r, other.URL+"/set", http.StatusTemporaryRedirect)
 	}))
 	defer redirecting.Close()
 
@@ -351,6 +352,43 @@ func TestWebhookRefusesRedirectToDifferentHost(t *testing.T) {
 	require.Error(t, err)
 	require.ErrorContains(t, err, "different host")
 	require.Zero(t, atomic.LoadInt32(&otherHits))
+}
+
+// TestWebhookRefusesMethodChangingRedirect checks that a 301/302/303, which
+// Go's client would follow as a bodyless GET, fails the write instead of
+// counting the GET's 2xx as the record having been set, and is not retried.
+func TestWebhookRefusesMethodChangingRedirect(t *testing.T) {
+	t.Parallel()
+
+	for _, code := range []int{http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther} {
+		t.Run(strconv.Itoa(code), func(t *testing.T) {
+			t.Parallel()
+
+			var redirects, targetHits int32
+
+			var mux http.ServeMux
+
+			mux.HandleFunc("/old", func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(&redirects, 1)
+				http.Redirect(w, r, "/new", code)
+			})
+			mux.HandleFunc("/new", func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(&targetHits, 1)
+				w.WriteHeader(http.StatusOK)
+			})
+
+			server := httptest.NewServer(&mux)
+			defer server.Close()
+
+			setter := newTestWebhookProvider(t, server.URL+"/old", map[string]string{"max_retries": "2"})
+
+			_, err := setter.SetRecords(t.Context(), "example.com", webhookTestRecords())
+			require.ErrorIs(t, err, errWebhookRedirect)
+			require.ErrorContains(t, err, strconv.Itoa(code))
+			require.Zero(t, atomic.LoadInt32(&targetHits), "redirect target must not be requested")
+			require.Equal(t, int32(1), atomic.LoadInt32(&redirects), "a refused redirect is not retried")
+		})
+	}
 }
 
 func TestWebhookAllowsRedirectToSameHost(t *testing.T) {
