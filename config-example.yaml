@@ -362,6 +362,9 @@ dns:
     # Example for provider: "rfc2136" (RFC 2136 TSIG-signed dynamic DNS
     # updates, e.g. BIND or PowerDNS with an update-policy grant for the
     # TSIG key). Generate a key with `tsig-keygen -a hmac-sha256 <key-name>`.
+    # Grant it TXT updates in a dedicated, delegated subzone only; see
+    # docs/ref/serve.md for why a narrower BIND grant cannot match the
+    # per-node challenge names.
     # provider_config:
     #   nameserver: "ns1.example.com:53"
     #   key_name: "headscale."

@@ -149,11 +149,37 @@ both `SetRecords` and `DeleteRecords`, so expired challenge records are
 deleted outright rather than left in the zone (see
 [Record cleanup](#record-cleanup)).
 
+Headscale writes one TXT RRset per node, at
+`_acme-challenge.<node>.<base_domain>`. `_acme-challenge` is the leftmost
+label and the node name sits between it and the zone, so the names differ in a
+middle label. BIND's `update-policy` cannot express that: `wildcard` and
+`subdomain` grants match names *below* a fixed name, and a grant such as
+`wildcard *._acme-challenge.example.com.` matches `x._acme-challenge.example.com`,
+never `_acme-challenge.node1.example.com`. Updates would be refused.
+
+Give Headscale a zone of its own instead: a subdomain such as `ts.example.com`
+that is used for nothing but the tailnet, delegated from the parent zone, with
+`dns.base_domain` and `dns.certificates.zone` both set to it. A zone-wide TXT
+grant on that subzone is then as narrow as it needs to be: a leaked TSIG key
+can write TXT records in `ts.example.com` only, not the SPF, DMARC or
+domain-verification records of `example.com`. Do not grant the key `zonesub`
+on a zone that holds other records.
+
 You need:
 
-- A DNS server authoritative for `dns.certificates.zone` (or `dns.base_domain`
-  if `zone` is empty) that accepts dynamic updates for the
-  `_acme-challenge.*` names under it.
+- A delegation for the subzone in the parent zone, for example in
+  `example.com`:
+
+  ```
+  ts      IN NS   ns1.example.com.
+  ```
+
+  The subzone only has to exist publicly (SOA and NS) so the ACME CA can
+  resolve the challenge records; node names are served by MagicDNS inside the
+  tailnet and need no public records.
+
+- A DNS server authoritative for the subzone that accepts dynamic updates.
+
 - A TSIG key. Generate one with, for example:
 
   ```console
@@ -162,16 +188,26 @@ You need:
 
   This prints a `key "headscale." { algorithm hmac-sha256; secret "..."; };`
   block. Add it to the server's configuration together with an update-policy
-  grant limited to `_acme-challenge` records, for example in BIND:
+  that lets it change TXT records, and nothing else, in the subzone. In BIND:
 
   ```
-  zone "example.com" {
+  zone "ts.example.com" {
       type primary;
-      file "example.com.zone";
+      file "ts.example.com.zone";
       update-policy {
-          grant headscale. name _acme-challenge.example.com. txt;
-          grant headscale. wildcard *._acme-challenge.example.com. txt;
+          grant headscale. zonesub TXT;
       };
+  };
+  ```
+
+  If `ts.example.com` cannot be delegated and has to live inside the
+  `example.com` zone (with `dns.certificates.zone: example.com`), grant each
+  challenge name exactly instead, and add a line for every new node:
+
+  ```
+  update-policy {
+      grant headscale. name _acme-challenge.node1.ts.example.com. TXT;
+      grant headscale. name _acme-challenge.node2.ts.example.com. TXT;
   };
   ```
 
@@ -182,7 +218,7 @@ dns:
   certificates:
     enabled: true
     provider: "rfc2136"
-    zone: "example.com"
+    zone: "ts.example.com"
     provider_config:
       # The RFC 2136 server's address, host:port.
       nameserver: "ns1.example.com:53"
@@ -250,7 +286,7 @@ application/json; charset=utf-8`:
 ```json
 {
   "action": "set",
-  "zone": "example.com",
+  "zone": "ts.example.com",
   "type": "TXT",
   "records": [
     {
