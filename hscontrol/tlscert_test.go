@@ -8,12 +8,14 @@ import (
 	"maps"
 	"net"
 	"slices"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/libdns/libdns"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/tailcfg"
@@ -722,16 +724,185 @@ func TestDNSCertificateManagerMergesRRset(t *testing.T) {
 	setTestChallenge(t, manager, v1)
 	require.ElementsMatch(t, []string{v1, v2}, store.rrset("_acme-challenge.node1"))
 
-	// A value the provider rejected is not carried into later writes.
+	// A value the provider rejected is not carried into later writes, and
+	// the value it would have evicted is kept.
 	store.setFail(true)
 
 	node := testCertNode()
 	require.Error(t, manager.setDNS(t.Context(), node, "example.com", nil, testChallengeRequest(node, v3)))
 	store.setFail(false)
 
+	// A third value evicts the one expiring first: v2, since v1 was re-sent.
 	v4 := testACMEValue("4")
 	setTestChallenge(t, manager, v4)
-	require.ElementsMatch(t, []string{v1, v2, v4}, store.rrset("_acme-challenge.node1"))
+	require.ElementsMatch(t, []string{v1, v4}, store.rrset("_acme-challenge.node1"))
+}
+
+// TestDNSCertificateManagerCapsValuesPerName checks that a client looping
+// with fresh values cannot grow the RRset past dnsCertMaxValuesPerName,
+// and that its newest values are the ones published.
+func TestDNSCertificateManagerCapsValuesPerName(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeRecordStore{}
+	manager := newDNSCertificateManagerForSetter(types.DNSCertificatesConfig{Zone: "example.com"}, store)
+
+	var values []string
+
+	for i := range 20 {
+		v := testACMEValue(strconv.Itoa(i))
+		values = append(values, v)
+		setTestChallenge(t, manager, v)
+		require.LessOrEqual(t, len(store.rrset("_acme-challenge.node1")), dnsCertMaxValuesPerName)
+	}
+
+	require.ElementsMatch(t, values[len(values)-dnsCertMaxValuesPerName:], store.rrset("_acme-challenge.node1"))
+
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+
+	require.Len(t, manager.records[testChallengeFQDN], dnsCertMaxValuesPerName)
+}
+
+// slowRecordStore is a fakeRecordStore whose writes take a while and which
+// records whether two writes for the same name ever overlapped.
+type slowRecordStore struct {
+	fakeRecordStore
+
+	delay time.Duration
+	// block, when set, holds writes for blockName until it is closed.
+	block     chan struct{}
+	blockName string
+
+	inflightMu sync.Mutex
+	inflight   map[string]int
+	overlapped bool
+}
+
+func (f *slowRecordStore) SetRecords(
+	ctx context.Context,
+	zone string,
+	records []libdns.Record,
+) ([]libdns.Record, error) {
+	name := records[0].RR().Name
+
+	f.inflightMu.Lock()
+	if f.inflight == nil {
+		f.inflight = make(map[string]int)
+	}
+	f.inflight[name]++
+	if f.inflight[name] > 1 {
+		f.overlapped = true
+	}
+	f.inflightMu.Unlock()
+
+	defer func() {
+		f.inflightMu.Lock()
+		f.inflight[name]--
+		f.inflightMu.Unlock()
+	}()
+
+	if f.block != nil && name == f.blockName {
+		<-f.block
+	}
+
+	time.Sleep(f.delay)
+
+	return f.fakeRecordStore.SetRecords(ctx, zone, records)
+}
+
+// TestDNSCertificateManagerConcurrentSameNameKeepsBothValues runs pairs of
+// concurrent requests for one name, as tailscaled does for <fqdn> and
+// *.<fqdn>, against a slow provider. Each pair must end up published in
+// full: neither write may drop the other's value.
+func TestDNSCertificateManagerConcurrentSameNameKeepsBothValues(t *testing.T) {
+	t.Parallel()
+
+	store := &slowRecordStore{delay: time.Millisecond}
+	manager := newDNSCertificateManagerForSetter(types.DNSCertificatesConfig{Zone: "example.com"}, store)
+	node := testCertNode()
+
+	for i := range 50 {
+		a, b := testACMEValue("a"+strconv.Itoa(i)), testACMEValue("b"+strconv.Itoa(i))
+
+		var wg sync.WaitGroup
+		for _, v := range []string{a, b} {
+			wg.Go(func() {
+				assert.NoError(t, manager.setDNS(t.Context(), node, "example.com", nil, testChallengeRequest(node, v)))
+			})
+		}
+		wg.Wait()
+
+		require.ElementsMatch(t, []string{a, b}, store.rrset("_acme-challenge.node1"), "pair %d", i)
+	}
+
+	store.inflightMu.Lock()
+	defer store.inflightMu.Unlock()
+
+	require.False(t, store.overlapped, "writes for one name must not overlap")
+}
+
+// TestDNSCertificateManagerSlowNameDoesNotBlockOthers guards against one
+// node's slow provider write stalling every other node's issuance.
+func TestDNSCertificateManagerSlowNameDoesNotBlockOthers(t *testing.T) {
+	t.Parallel()
+
+	store := &slowRecordStore{block: make(chan struct{}), blockName: "_acme-challenge.node1"}
+	manager := newDNSCertificateManagerForSetter(types.DNSCertificatesConfig{Zone: "example.com"}, store)
+
+	slowNode := testCertNode()
+	fastNode := (&types.Node{ID: 2, GivenName: "node2", NodeKey: key.NewNode().Public()}).View()
+
+	slowDone := make(chan error, 1)
+
+	go func() {
+		slowDone <- manager.setDNS(t.Context(), slowNode, "example.com", nil,
+			testChallengeRequest(slowNode, testACMEValue("slow")))
+	}()
+
+	require.Eventually(t, func() bool {
+		store.inflightMu.Lock()
+		defer store.inflightMu.Unlock()
+
+		return store.inflight["_acme-challenge.node1"] == 1
+	}, 5*time.Second, time.Millisecond, "slow write is in flight")
+
+	require.NoError(t, manager.setDNS(t.Context(), fastNode, "example.com", nil, tailcfg.SetDNSRequest{
+		NodeKey: fastNode.NodeKey(),
+		Name:    "_acme-challenge.node2.example.com",
+		Type:    "TXT",
+		Value:   testACMEValue("fast"),
+	}))
+
+	close(store.block)
+	require.NoError(t, <-slowDone)
+
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+
+	require.Empty(t, manager.nameLocks, "name locks are released")
+}
+
+func TestNodeRateLimiter(t *testing.T) {
+	t.Parallel()
+
+	l := newNodeRateLimiter(3, 10*time.Second)
+	now := time.Now()
+
+	for range 3 {
+		require.True(t, l.allow(1, now))
+	}
+
+	require.False(t, l.allow(1, now), "burst exhausted")
+	require.True(t, l.allow(2, now), "other nodes have their own bucket")
+
+	require.False(t, l.allow(1, now.Add(9*time.Second)))
+	require.True(t, l.allow(1, now.Add(10*time.Second)), "one token back per interval")
+	require.False(t, l.allow(1, now.Add(10*time.Second)))
+
+	// Idle, full buckets are forgotten.
+	l.allow(3, now.Add(time.Hour))
+	require.Len(t, l.buckets, 1)
 }
 
 func TestDNSCertificateManagerCleanup(t *testing.T) {

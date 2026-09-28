@@ -596,6 +596,28 @@ func TestSetDNSHandlerProviderFailureIsBadGateway(t *testing.T) {
 	require.NotContains(t, rec.Body.String(), "provider down", "provider errors stay in the server log")
 }
 
+func TestSetDNSHandlerRateLimitsPerNode(t *testing.T) {
+	t.Parallel()
+
+	setter := &fakeRecordSetter{}
+	app, node := setDNSTestApp(t, setter)
+
+	send := func(i int) int {
+		return doSetDNS(t, app, node.MachineKey, tailcfg.SetDNSRequest{
+			NodeKey: node.NodeKey,
+			Name:    "_acme-challenge.cert-node.example.com",
+			Type:    "TXT",
+			Value:   testACMEValue(strconv.Itoa(i)),
+		}).Code
+	}
+
+	for i := range setDNSRateBurst {
+		require.Equal(t, http.StatusOK, send(i), "request %d", i)
+	}
+
+	require.Equal(t, http.StatusTooManyRequests, send(setDNSRateBurst))
+}
+
 // TestSSHActionHoldAndDelegate_PersistsAuthSession guards the happy path: the
 // initial SSH-check poll returns a HoldAndDelegate URL carrying an auth_id, and
 // that auth session must remain in the cache for the follow-up poll to find.

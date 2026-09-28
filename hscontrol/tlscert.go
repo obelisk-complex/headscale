@@ -28,6 +28,19 @@ const (
 	// acmeDNS01ValueLength is the length of an unpadded base64url SHA-256
 	// digest, the only value an ACME DNS-01 TXT record carries.
 	acmeDNS01ValueLength = 43
+
+	// dnsCertMaxValuesPerName caps the TXT values Headscale keeps published
+	// for one challenge name. tailscaled validates at most two authorisations
+	// under one name at once (<fqdn> and *.<fqdn>); when a third value arrives
+	// the one expiring soonest is dropped, so a retrying client always gets
+	// its newest value published and a looping client cannot grow the RRset.
+	dnsCertMaxValuesPerName = 2
+
+	// setDNSRateBurst and setDNSRateInterval bound /machine/set-dns per node:
+	// a burst of setDNSRateBurst requests, refilled at one per interval.
+	// A certificate order needs one request per name, two with a wildcard.
+	setDNSRateBurst    = 6
+	setDNSRateInterval = 10 * time.Second
 )
 
 var (
@@ -37,6 +50,7 @@ var (
 	errDNSCertRecordName     = errors.New("DNS record name is not allowed")
 	errDNSCertRecordValue    = errors.New("invalid TXT record value")
 	errDNSCertPropagation    = errors.New("DNS record not visible on authoritative name servers")
+	errDNSCertRateLimited    = errors.New("too many DNS record updates")
 )
 
 // DNSCertificateProviderFactory constructs a libdns RecordSetter from the
@@ -111,6 +125,8 @@ func newDNSCertificateManagerForSetter(
 		setter:          setter,
 		records:         make(map[string]map[string]time.Time),
 		cleanupTimers:   make(map[string]*time.Timer),
+		nameLocks:       make(map[string]*dnsNameLock),
+		limiter:         newNodeRateLimiter(setDNSRateBurst, setDNSRateInterval),
 	}
 
 	// Deleting is optional for providers: without it the RRset is still
@@ -146,13 +162,58 @@ type dnsCertificateManager struct {
 	// served by every authoritative name server of its zone.
 	propagation *dnsPropagationChecker
 
-	// mu serialises every provider write, so each write carries the
-	// complete RRset for its name and no two writes race to replace it.
+	// mu guards the maps below. It is never held across a provider call.
 	mu sync.Mutex
 	// records is the TXT RRset Headscale owns per challenge name (canonical,
-	// fully qualified), as value -> expiry.
+	// fully qualified), as value -> expiry. An entry is only changed by the
+	// holder of that name's lock.
 	records       map[string]map[string]time.Time
 	cleanupTimers map[string]*time.Timer
+	// nameLocks serialises the read-modify-write of one name's RRset,
+	// including the provider write, so each write carries the complete
+	// RRset and no two writes for a name race to replace it. Writes for
+	// different names proceed in parallel.
+	nameLocks map[string]*dnsNameLock
+
+	limiter *nodeRateLimiter
+}
+
+type dnsNameLock struct {
+	mu   sync.Mutex
+	refs int // goroutines holding or waiting for mu; guarded by manager mu
+}
+
+// lockName takes the lock for name and returns its release function.
+func (m *dnsCertificateManager) lockName(name string) func() {
+	m.mu.Lock()
+
+	l := m.nameLocks[name]
+	if l == nil {
+		l = &dnsNameLock{}
+		m.nameLocks[name] = l
+	}
+
+	l.refs++
+	m.mu.Unlock()
+
+	l.mu.Lock()
+
+	return func() {
+		l.mu.Unlock()
+
+		m.mu.Lock()
+		defer m.mu.Unlock()
+
+		l.refs--
+		if l.refs == 0 {
+			delete(m.nameLocks, name)
+		}
+	}
+}
+
+// allowRequest reports whether node may make another SetDNS request now.
+func (m *dnsCertificateManager) allowRequest(node types.NodeID) bool {
+	return m.limiter.allow(node, time.Now())
 }
 
 // setDNS publishes the node's ACME DNS-01 TXT value and returns once the
@@ -198,11 +259,15 @@ func (m *dnsCertificateManager) setDNS(
 // publish adds value to the TXT RRset for name and writes the whole RRset,
 // so concurrent authorisations for the same name (tailscaled requests a
 // certificate for both <fqdn> and *.<fqdn> under one challenge name) all
-// stay valid. The lock is held only for the provider write, never while
-// waiting for propagation, so a slow zone does not stall other nodes.
+// stay valid. At most [dnsCertMaxValuesPerName] values are kept; the one
+// expiring soonest makes room for a new one. Only name's lock is held
+// across the provider write, and nothing is held while waiting for
+// propagation, so a slow provider or zone does not stall other nodes.
 func (m *dnsCertificateManager) publish(ctx context.Context, name, value string) error {
+	unlock := m.lockName(name)
+	defer unlock()
+
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	now := time.Now()
 	m.dropExpiredLocked(name, now)
@@ -213,18 +278,28 @@ func (m *dnsCertificateManager) publish(ctx context.Context, name, value string)
 		m.records[name] = values
 	}
 
-	previous, existed := values[value]
+	// Snapshot the RRset so a failed write can restore it exactly.
+	before := maps.Clone(values)
+
+	if _, existed := values[value]; !existed && len(values) >= dnsCertMaxValuesPerName {
+		delete(values, oldestValue(values))
+	}
+
 	values[value] = now.Add(m.retention)
+	rrset := m.rrsetLocked(name)
 
-	if _, err := m.setter.SetRecords(ctx, m.zone, m.rrsetLocked(name)); err != nil {
-		if existed {
-			values[value] = previous
-		} else {
-			delete(values, value)
-		}
+	m.mu.Unlock()
 
-		if len(values) == 0 {
+	_, err := m.setter.SetRecords(ctx, m.zone, rrset)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if err != nil {
+		if len(before) == 0 {
 			delete(m.records, name)
+		} else {
+			m.records[name] = before
 		}
 
 		return fmt.Errorf("setting ACME DNS-01 TXT record: %w", err)
@@ -233,6 +308,23 @@ func (m *dnsCertificateManager) publish(ctx context.Context, name, value string)
 	m.scheduleCleanupLocked(name)
 
 	return nil
+}
+
+// oldestValue returns the value in values that expires first, breaking
+// ties by value so the choice is deterministic.
+func oldestValue(values map[string]time.Time) string {
+	var (
+		oldest  string
+		expires time.Time
+	)
+
+	for v, exp := range values {
+		if oldest == "" || exp.Before(expires) || (exp.Equal(expires) && v < oldest) {
+			oldest, expires = v, exp
+		}
+	}
+
+	return oldest
 }
 
 // rrsetLocked returns the libdns records for every value held for name.
@@ -289,29 +381,39 @@ func (m *dnsCertificateManager) scheduleCleanupLocked(name string) {
 // are still live are rewritten as the RRset; when none remain the records
 // are deleted if the provider supports it.
 func (m *dnsCertificateManager) cleanup(name string) {
+	unlock := m.lockName(name)
+	defer unlock()
+
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	delete(m.cleanupTimers, name)
 
 	expired := m.dropExpiredLocked(name, time.Now())
 	if len(expired) == 0 {
 		m.scheduleCleanupLocked(name)
+		m.mu.Unlock()
 
 		return
 	}
 
+	_, live := m.records[name]
+	rrset := m.rrsetLocked(name)
+
+	m.mu.Unlock()
+
 	ctx, cancel := context.WithTimeout(context.Background(), dnsCertCleanupTimeout)
 	defer cancel()
 
-	if _, live := m.records[name]; live {
-		_, err := m.setter.SetRecords(ctx, m.zone, m.rrsetLocked(name))
+	if live {
+		_, err := m.setter.SetRecords(ctx, m.zone, rrset)
 		if err != nil {
 			log.Warn().Err(err).Str("dns.name", name).
 				Msg("failed to remove expired ACME DNS-01 values from TXT RRset")
 		}
 
+		m.mu.Lock()
 		m.scheduleCleanupLocked(name)
+		m.mu.Unlock()
 
 		return
 	}
@@ -334,6 +436,68 @@ func (m *dnsCertificateManager) cleanup(name string) {
 		log.Warn().Err(err).Str("dns.name", name).
 			Msg("failed to delete expired ACME DNS-01 TXT record")
 	}
+}
+
+// nodeRateLimiter is a per-node token bucket.
+type nodeRateLimiter struct {
+	burst    float64
+	interval time.Duration
+
+	mu        sync.Mutex
+	buckets   map[types.NodeID]*tokenBucket
+	lastSweep time.Time
+}
+
+type tokenBucket struct {
+	tokens float64
+	last   time.Time
+}
+
+func newNodeRateLimiter(burst int, interval time.Duration) *nodeRateLimiter {
+	return &nodeRateLimiter{
+		burst:    float64(burst),
+		interval: interval,
+		buckets:  make(map[types.NodeID]*tokenBucket),
+	}
+}
+
+func (l *nodeRateLimiter) refill(b *tokenBucket, now time.Time) {
+	b.tokens = min(l.burst, b.tokens+float64(now.Sub(b.last))/float64(l.interval))
+	b.last = now
+}
+
+// allow takes a token from node's bucket, reporting false when it is empty.
+func (l *nodeRateLimiter) allow(node types.NodeID, now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	// A full bucket is the same as no bucket, so forget those now and then
+	// to keep the map bounded by recently active nodes.
+	if now.Sub(l.lastSweep) > time.Duration(l.burst)*l.interval {
+		for id, b := range l.buckets {
+			if l.refill(b, now); b.tokens >= l.burst {
+				delete(l.buckets, id)
+			}
+		}
+
+		l.lastSweep = now
+	}
+
+	b := l.buckets[node]
+	if b == nil {
+		b = &tokenBucket{tokens: l.burst, last: now}
+		l.buckets[node] = b
+	}
+
+	l.refill(b, now)
+
+	if b.tokens < 1 {
+		return false
+	}
+
+	b.tokens--
+
+	return true
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) error {

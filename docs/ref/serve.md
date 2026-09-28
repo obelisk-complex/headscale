@@ -272,9 +272,9 @@ application/json; charset=utf-8`:
   record type.
 - `records` is the **complete current RRset** for `name`, matching libdns
   `SetRecords` semantics: it replaces whatever the backend holds for that
-  name, it is not a diff. It normally holds one record; it holds more than
-  one only while two ACME orders for the same node (for example `<node>` and
-  `*.<node>`) are validating concurrently. `name` is relative to `zone`
+  name, it is not a diff. It normally holds one record; it holds two only
+  while two ACME orders for the same node (for example `<node>` and
+  `*.<node>`) are validating concurrently, and never more than two. `name` is relative to `zone`
   (`"_acme-challenge.node1"`, not the FQDN). `ttl` is whole seconds, `0` when
   unset.
 - On `delete_url`, `records` holds only the values Headscale is removing
@@ -306,6 +306,17 @@ application/json; charset=utf-8`:
 - Concurrent TXT values for the same challenge name are preserved in the RRset
   so overlapping ACME validations (for example `<node>` and `*.<node>`) do not
   replace each other.
+- At most two values are kept per challenge name. A third value replaces the
+  one expiring soonest rather than being refused, so a client retrying an
+  order always has its newest challenge published, and a client looping with
+  fresh values cannot grow the RRset or multiply provider writes and
+  propagation checks.
+- Each node may make 6 `/machine/set-dns` requests in a burst, refilled at one
+  every 10 seconds; further requests get `429 Too Many Requests`. A
+  certificate order needs one request, two with a wildcard.
+- Provider writes for one challenge name are serialised; writes for different
+  names run in parallel, so one node's slow provider call or webhook retries
+  do not delay other nodes.
 
 ## Record cleanup
 

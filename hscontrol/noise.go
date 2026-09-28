@@ -870,6 +870,12 @@ func (ns *noiseServer) SetDNSHandler(writer http.ResponseWriter, req *http.Reque
 		return
 	}
 
+	if !ns.headscale.dnsCertManager.allowRequest(nv.ID()) {
+		httpError(writer, NewHTTPError(http.StatusTooManyRequests, "too many DNS record updates", errDNSCertRateLimited))
+
+		return
+	}
+
 	err = ns.headscale.dnsCertManager.setDNS(
 		req.Context(),
 		nv,
