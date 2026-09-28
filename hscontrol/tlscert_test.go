@@ -666,6 +666,10 @@ func (f *fakeRecordStore) setFail(fail bool) {
 
 type fakeDeletingRecordStore struct {
 	fakeRecordStore
+
+	// failDeletes is how many upcoming DeleteRecords calls fail.
+	failDeletes    int
+	deleteAttempts int
 }
 
 func (f *fakeDeletingRecordStore) DeleteRecords(
@@ -675,6 +679,14 @@ func (f *fakeDeletingRecordStore) DeleteRecords(
 ) ([]libdns.Record, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
+	f.deleteAttempts++
+
+	if f.failDeletes > 0 {
+		f.failDeletes--
+
+		return nil, errors.New("provider down")
+	}
 
 	for _, r := range records {
 		rr := r.RR()
@@ -971,4 +983,124 @@ func TestDNSCertificateManagerCleanupTimerFires(t *testing.T) {
 		return slices.Equal([]string{v1}, store.deletedValues())
 	}, 5*time.Second, 5*time.Millisecond)
 	require.Empty(t, store.rrset("_acme-challenge.node1"))
+}
+
+// heldValues returns the values the manager holds for the test challenge.
+func heldValues(m *dnsCertificateManager) []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return slices.Sorted(maps.Keys(m.records[testChallengeFQDN]))
+}
+
+// TestDNSCertificateManagerCleanupRetriesFailedDelete checks that a failed
+// delete of the last expired value keeps the value tracked and retries,
+// rather than forgetting a record that is still published.
+func TestDNSCertificateManagerCleanupRetriesFailedDelete(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeDeletingRecordStore{failDeletes: 1}
+	manager := newDNSCertificateManagerForSetter(types.DNSCertificatesConfig{Zone: "example.com"}, store)
+	manager.cleanupRetry = time.Hour // the test drives the retry itself
+
+	v1 := testACMEValue("1")
+	setTestChallenge(t, manager, v1)
+
+	expireValue(manager, v1)
+	manager.cleanup(testChallengeFQDN)
+
+	require.Equal(t, []string{v1}, store.rrset("_acme-challenge.node1"), "the delete failed")
+	require.Equal(t, []string{v1}, heldValues(manager), "a value is not forgotten before it is removed")
+
+	manager.mu.Lock()
+	require.Contains(t, manager.cleanupTimers, testChallengeFQDN, "a retry is scheduled")
+	require.Equal(t, 1, manager.cleanupFailures[testChallengeFQDN])
+	manager.mu.Unlock()
+
+	manager.cleanup(testChallengeFQDN)
+
+	require.Equal(t, []string{v1}, store.deletedValues())
+	require.Empty(t, store.rrset("_acme-challenge.node1"))
+
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+
+	require.Empty(t, manager.records)
+	require.Empty(t, manager.cleanupTimers)
+	require.Empty(t, manager.cleanupFailures)
+}
+
+// TestDNSCertificateManagerCleanupRetryTimerFires checks the retry end to
+// end: a cleanup whose first delete fails still removes the record.
+func TestDNSCertificateManagerCleanupRetryTimerFires(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeDeletingRecordStore{failDeletes: 1}
+	manager := newDNSCertificateManagerForSetter(types.DNSCertificatesConfig{Zone: "example.com"}, store)
+	manager.retention = 20 * time.Millisecond
+	manager.cleanupRetry = 20 * time.Millisecond
+
+	v1 := testACMEValue("1")
+	setTestChallenge(t, manager, v1)
+
+	require.Eventually(t, func() bool {
+		return slices.Equal([]string{v1}, store.deletedValues())
+	}, 5*time.Second, 5*time.Millisecond)
+	require.Empty(t, store.rrset("_acme-challenge.node1"))
+	require.Empty(t, heldValues(manager))
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	require.Equal(t, 2, store.deleteAttempts)
+}
+
+// TestDNSCertificateManagerCleanupRetriesFailedRewrite covers the rewrite
+// path, where other values are still live, and a publish that fails while
+// an expired value is pending removal.
+func TestDNSCertificateManagerCleanupRetriesFailedRewrite(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeDeletingRecordStore{}
+	manager := newDNSCertificateManagerForSetter(types.DNSCertificatesConfig{Zone: "example.com"}, store)
+	manager.cleanupRetry = time.Hour
+
+	v1, v2, v3 := testACMEValue("1"), testACMEValue("2"), testACMEValue("3")
+	setTestChallenge(t, manager, v1)
+	setTestChallenge(t, manager, v2)
+	expireValue(manager, v1)
+
+	store.setFail(true)
+	manager.cleanup(testChallengeFQDN)
+	require.ElementsMatch(t, []string{v1, v2}, heldValues(manager), "the rewrite failed")
+
+	// A failed publish must not drop the expired value either: the provider
+	// still serves it.
+	node := testCertNode()
+	require.Error(t, manager.setDNS(t.Context(), node, "example.com", nil, testChallengeRequest(node, v3)))
+	require.ElementsMatch(t, []string{v1, v2}, heldValues(manager))
+
+	store.setFail(false)
+	manager.cleanup(testChallengeFQDN)
+	require.Equal(t, []string{v2}, store.rrset("_acme-challenge.node1"))
+	require.Equal(t, []string{v2}, heldValues(manager))
+	require.Empty(t, store.deletedValues())
+}
+
+func TestDNSCertificateManagerCleanupBackoff(t *testing.T) {
+	t.Parallel()
+
+	manager := newDNSCertificateManagerForSetter(types.DNSCertificatesConfig{Zone: "example.com"}, &fakeRecordStore{})
+
+	var got []time.Duration
+
+	for failures := 1; failures <= 7; failures++ {
+		manager.cleanupFailures["x"] = failures
+		got = append(got, manager.cleanupBackoffLocked("x"))
+	}
+
+	require.Equal(t, []time.Duration{
+		30 * time.Second, time.Minute, 2 * time.Minute, 4 * time.Minute,
+		8 * time.Minute, 10 * time.Minute, 10 * time.Minute,
+	}, got)
 }

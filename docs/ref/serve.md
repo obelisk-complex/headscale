@@ -381,7 +381,9 @@ prevent this on its own.
 Each challenge value stays published for 10 minutes, or for `ttl` if that is
 longer. When it expires Headscale rewrites the RRset without it; when the last
 value for a name expires, Headscale deletes the record if the provider
-implements `libdns.RecordDeleter`.
+implements `libdns.RecordDeleter`. If that write fails, Headscale keeps
+tracking the expired value and retries after 30 seconds, doubling the delay
+on each further failure up to 10 minutes, until the provider accepts it.
 
 If the provider only implements `libdns.RecordSetter`, the last value for each
 name stays in the zone until the node's next certificate request replaces it.

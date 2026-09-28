@@ -22,6 +22,12 @@ const (
 
 	dnsCertCleanupTimeout = 30 * time.Second
 
+	// A failed cleanup write is retried after dnsCertCleanupRetryBase,
+	// doubling per consecutive failure up to dnsCertCleanupRetryMax, until
+	// it succeeds, so a provider outage does not orphan stale records.
+	dnsCertCleanupRetryBase = 30 * time.Second
+	dnsCertCleanupRetryMax  = 10 * time.Minute
+
 	dnsPropagationPollInterval = 2 * time.Second
 	dnsPropagationQueryTimeout = 5 * time.Second
 
@@ -125,6 +131,9 @@ func newDNSCertificateManagerForSetter(
 		setter:          setter,
 		records:         make(map[string]map[string]time.Time),
 		cleanupTimers:   make(map[string]*time.Timer),
+		cleanupFailures: make(map[string]int),
+		cleanupRetry:    dnsCertCleanupRetryBase,
+		cleanupRetryMax: dnsCertCleanupRetryMax,
 		nameLocks:       make(map[string]*dnsNameLock),
 		limiter:         newNodeRateLimiter(setDNSRateBurst, setDNSRateInterval),
 	}
@@ -167,8 +176,15 @@ type dnsCertificateManager struct {
 	// records is the TXT RRset Headscale owns per challenge name (canonical,
 	// fully qualified), as value -> expiry. An entry is only changed by the
 	// holder of that name's lock.
+	// A value is only removed from records once a provider write without
+	// it has succeeded, so a failed write never loses track of a value
+	// that is still published.
 	records       map[string]map[string]time.Time
 	cleanupTimers map[string]*time.Timer
+	// cleanupFailures counts consecutive failed cleanup writes per name.
+	cleanupFailures map[string]int
+	cleanupRetry    time.Duration
+	cleanupRetryMax time.Duration
 	// nameLocks serialises the read-modify-write of one name's RRset,
 	// including the provider write, so each write carries the complete
 	// RRset and no two writes for a name race to replace it. Writes for
@@ -269,17 +285,18 @@ func (m *dnsCertificateManager) publish(ctx context.Context, name, value string)
 
 	m.mu.Lock()
 
+	// Snapshot the RRset before dropping expired values, so a failed write
+	// restores them too: they are still published until a write succeeds.
+	before := maps.Clone(m.records[name])
+
 	now := time.Now()
-	m.dropExpiredLocked(name, now)
+	m.forgetLocked(name, m.expiredLocked(name, now))
 
 	values := m.records[name]
 	if values == nil {
 		values = make(map[string]time.Time)
 		m.records[name] = values
 	}
-
-	// Snapshot the RRset so a failed write can restore it exactly.
-	before := maps.Clone(values)
 
 	if _, existed := values[value]; !existed && len(values) >= dnsCertMaxValuesPerName {
 		delete(values, oldestValue(values))
@@ -302,9 +319,14 @@ func (m *dnsCertificateManager) publish(ctx context.Context, name, value string)
 			m.records[name] = before
 		}
 
+		m.scheduleCleanupLocked(name)
+
 		return fmt.Errorf("setting ACME DNS-01 TXT record: %w", err)
 	}
 
+	// This write carried no expired values, so it also did any cleanup a
+	// failed cleanup write left pending.
+	delete(m.cleanupFailures, name)
 	m.scheduleCleanupLocked(name)
 
 	return nil
@@ -327,35 +349,56 @@ func oldestValue(values map[string]time.Time) string {
 	return oldest
 }
 
-// rrsetLocked returns the libdns records for every value held for name.
-func (m *dnsCertificateManager) rrsetLocked(name string) []libdns.Record {
+// rrsetLocked returns the libdns records for every value held for name,
+// leaving out those in exclude.
+func (m *dnsCertificateManager) rrsetLocked(name string, exclude ...string) []libdns.Record {
+	values := make([]string, 0, len(m.records[name]))
+
+	for _, txt := range slices.Sorted(maps.Keys(m.records[name])) {
+		if !slices.Contains(exclude, txt) {
+			values = append(values, txt)
+		}
+	}
+
+	return m.txtRecords(name, values)
+}
+
+func (m *dnsCertificateManager) txtRecords(name string, values []string) []libdns.Record {
 	relative := m.relativeRecordName(name)
-	values := m.records[name]
 
 	records := make([]libdns.Record, 0, len(values))
-	for _, txt := range slices.Sorted(maps.Keys(values)) {
+	for _, txt := range values {
 		records = append(records, libdns.TXT{Name: relative, TTL: m.ttl, Text: txt})
 	}
 
 	return records
 }
 
-// dropExpiredLocked forgets expired values for name and returns them.
-func (m *dnsCertificateManager) dropExpiredLocked(name string, now time.Time) []string {
+// expiredLocked returns the values for name that have expired by now,
+// without forgetting them.
+func (m *dnsCertificateManager) expiredLocked(name string, now time.Time) []string {
 	var expired []string
 
 	for value, expires := range m.records[name] {
 		if !now.Before(expires) {
 			expired = append(expired, value)
-			delete(m.records[name], value)
 		}
+	}
+
+	slices.Sort(expired)
+
+	return expired
+}
+
+// forgetLocked removes values from the RRset held for name.
+func (m *dnsCertificateManager) forgetLocked(name string, values []string) {
+	for _, value := range values {
+		delete(m.records[name], value)
 	}
 
 	if len(m.records[name]) == 0 {
 		delete(m.records, name)
 	}
-
-	return expired
 }
 
 // scheduleCleanupLocked arms the cleanup timer for name to fire when its
@@ -379,16 +422,20 @@ func (m *dnsCertificateManager) scheduleCleanupLocked(name string) {
 
 // cleanup removes expired challenge values for name from DNS. Values that
 // are still live are rewritten as the RRset; when none remain the records
-// are deleted if the provider supports it.
+// are deleted if the provider supports it. Expired values are forgotten
+// only once that write succeeds; a failed write is retried with backoff.
 func (m *dnsCertificateManager) cleanup(name string) {
 	unlock := m.lockName(name)
 	defer unlock()
 
 	m.mu.Lock()
 
-	delete(m.cleanupTimers, name)
+	if t := m.cleanupTimers[name]; t != nil {
+		t.Stop() // no-op when this call is the timer firing
+		delete(m.cleanupTimers, name)
+	}
 
-	expired := m.dropExpiredLocked(name, time.Now())
+	expired := m.expiredLocked(name, time.Now())
 	if len(expired) == 0 {
 		m.scheduleCleanupLocked(name)
 		m.mu.Unlock()
@@ -396,46 +443,74 @@ func (m *dnsCertificateManager) cleanup(name string) {
 		return
 	}
 
-	_, live := m.records[name]
-	rrset := m.rrsetLocked(name)
+	live := len(m.records[name]) > len(expired)
+	rrset := m.rrsetLocked(name, expired...)
 
 	m.mu.Unlock()
 
+	err := m.removeExpired(name, live, rrset, expired)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if err != nil {
+		m.cleanupFailures[name]++
+		delay := m.cleanupBackoffLocked(name)
+
+		log.Warn().Err(err).Str("dns.name", name).Dur("retry_in", delay).
+			Msg("failed to remove expired ACME DNS-01 TXT values, will retry")
+
+		m.cleanupTimers[name] = time.AfterFunc(delay, func() {
+			m.cleanup(name)
+		})
+
+		return
+	}
+
+	delete(m.cleanupFailures, name)
+	m.forgetLocked(name, expired)
+	m.scheduleCleanupLocked(name)
+}
+
+// removeExpired makes the provider stop serving expired: by rewriting the
+// RRset as rrset while other values are live, otherwise by deleting them.
+func (m *dnsCertificateManager) removeExpired(
+	name string,
+	live bool,
+	rrset []libdns.Record,
+	expired []string,
+) error {
 	ctx, cancel := context.WithTimeout(context.Background(), dnsCertCleanupTimeout)
 	defer cancel()
 
 	if live {
 		_, err := m.setter.SetRecords(ctx, m.zone, rrset)
-		if err != nil {
-			log.Warn().Err(err).Str("dns.name", name).
-				Msg("failed to remove expired ACME DNS-01 values from TXT RRset")
-		}
 
-		m.mu.Lock()
-		m.scheduleCleanupLocked(name)
-		m.mu.Unlock()
-
-		return
+		return err
 	}
 
 	if m.deleter == nil {
 		log.Debug().Str("dns.name", name).
 			Msg("DNS certificate provider cannot delete records; expired ACME DNS-01 TXT record left in place")
 
-		return
+		return nil
 	}
 
-	relative := m.relativeRecordName(name)
-	records := make([]libdns.Record, 0, len(expired))
+	_, err := m.deleter.DeleteRecords(ctx, m.zone, m.txtRecords(name, expired))
 
-	for _, txt := range expired {
-		records = append(records, libdns.TXT{Name: relative, TTL: m.ttl, Text: txt})
+	return err
+}
+
+// cleanupBackoffLocked returns the delay before retrying a failed cleanup
+// of name: cleanupRetry, doubled per further consecutive failure, capped at
+// cleanupRetryMax.
+func (m *dnsCertificateManager) cleanupBackoffLocked(name string) time.Duration {
+	delay := m.cleanupRetry
+	for i := 1; i < m.cleanupFailures[name] && delay < m.cleanupRetryMax; i++ {
+		delay *= 2
 	}
 
-	if _, err := m.deleter.DeleteRecords(ctx, m.zone, records); err != nil {
-		log.Warn().Err(err).Str("dns.name", name).
-			Msg("failed to delete expired ACME DNS-01 TXT record")
-	}
+	return min(delay, m.cleanupRetryMax)
 }
 
 // nodeRateLimiter is a per-node token bucket.
