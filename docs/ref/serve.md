@@ -36,6 +36,19 @@ publish ACME DNS-01 TXT challenge records for the node.
 8. The client asks the ACME CA to validate DNS-01 and stores the issued
    certificate locally.
 
+!!! warning "Node names become public"
+
+    Publicly trusted CAs log every certificate they issue in public
+    [Certificate Transparency](https://certificate.transparency.dev/) logs,
+    so each node that obtains a certificate publishes
+    `<node>.<base_domain>` there, permanently. The
+    `_acme-challenge.<node>.<base_domain>` TXT record is also visible in
+    public DNS while it is live. Once this feature is enabled, anyone can
+    enumerate the hostnames of your nodes that use it. Tailscale avoids this
+    with randomly generated tailnet names; Headscale uses your
+    `base_domain` and the node names as given, so choose both with that in
+    mind.
+
 ## Configuration
 
 ```yaml
