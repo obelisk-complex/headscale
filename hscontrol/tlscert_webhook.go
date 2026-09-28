@@ -146,10 +146,14 @@ func parseWebhookConfig(raw map[string]string) (webhookConfig, error) {
 // insecureHTTP allows http for local or test use. This is the operator's own
 // configuration, not attacker-controlled input, but a sane default still
 // avoids sending challenge values in the clear by accident.
+//
+// Errors never quote raw: the URL may carry a credential (in userinfo or the
+// query string), and these errors end up in logs.
 func validateWebhookURL(key, raw string, insecureHTTP bool) (*url.URL, error) {
 	target, err := url.Parse(raw)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", key, err)
+		// *url.Error embeds the whole input, so drop it.
+		return nil, fmt.Errorf("%s: not a valid URL", key)
 	}
 
 	switch target.Scheme {
@@ -158,7 +162,7 @@ func validateWebhookURL(key, raw string, insecureHTTP bool) (*url.URL, error) {
 		if !insecureHTTP {
 			return nil, fmt.Errorf(
 				"%s: %q uses http, set insecure_http: \"true\" to allow this (local/test use only)",
-				key, raw,
+				key, redactWebhookURL(target),
 			)
 		}
 	default:
@@ -166,10 +170,16 @@ func validateWebhookURL(key, raw string, insecureHTTP bool) (*url.URL, error) {
 	}
 
 	if target.Host == "" {
-		return nil, fmt.Errorf("%s: missing host: %s", key, raw)
+		return nil, fmt.Errorf("%s: missing host", key)
 	}
 
 	return target, nil
+}
+
+// redactWebhookURL renders u for logs and errors as scheme://host/path,
+// leaving out userinfo, query and fragment, where a credential may live.
+func redactWebhookURL(u *url.URL) string {
+	return (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: u.Path}).String()
 }
 
 func webhookConfigBool(raw map[string]string, key string, def bool) (bool, error) {
@@ -354,7 +364,7 @@ func (p *webhookProvider) attempt(
 ) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target.String(), bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("webhook %s: building request: %w", action, err)
+		return fmt.Errorf("webhook %s: building request for %s failed", action, redactWebhookURL(target))
 	}
 
 	req.Header.Set("Content-Type", "application/json; charset=utf-8")
@@ -373,6 +383,18 @@ func (p *webhookProvider) attempt(
 
 	resp, err := p.client.Do(req)
 	if err != nil {
+		// The client's *url.Error quotes the full request URL, query
+		// string included; replace it with the redacted form.
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			redacted := redactWebhookURL(target)
+			if u, perr := url.Parse(urlErr.URL); perr == nil {
+				redacted = redactWebhookURL(u)
+			}
+
+			urlErr.URL = redacted
+		}
+
 		return fmt.Errorf("webhook %s: %w", action, err)
 	}
 	defer resp.Body.Close()

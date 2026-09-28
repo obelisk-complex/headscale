@@ -513,3 +513,61 @@ func TestWebhookRetryBackoffDoesNotExceedBudget(t *testing.T) {
 	// Backoff schedule is 200ms, 400ms, 800ms = 1.4s; allow generous slack.
 	require.Less(t, elapsed, 5*time.Second)
 }
+
+// TestWebhookErrorsDoNotLeakURLSecrets checks that a credential carried in
+// a webhook URL's query string or userinfo never appears in an error, since
+// those errors are logged.
+func TestWebhookErrorsDoNotLeakURLSecrets(t *testing.T) {
+	t.Parallel()
+
+	const secret = "s3cr3t-query-token"
+
+	requireNoSecret := func(t *testing.T, err error) {
+		t.Helper()
+		require.Error(t, err)
+		require.NotContains(t, err.Error(), secret)
+		require.NotContains(t, err.Error(), "token=")
+	}
+
+	t.Run("config validation", func(t *testing.T) {
+		t.Parallel()
+
+		for _, raw := range []map[string]string{
+			{"set_url": "http://user:" + secret + "@example.com/set?token=" + secret},
+			{"set_url": "https://example.com/%zz?token=" + secret},
+			{"set_url": "https:///set?token=" + secret},
+			{"set_url": "https://example.com/set", "delete_url": "http://example.com/del?token=" + secret},
+		} {
+			_, err := newWebhookDNSProvider(raw)
+			requireNoSecret(t, err)
+		}
+	})
+
+	t.Run("transport error", func(t *testing.T) {
+		t.Parallel()
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+		addr := server.URL
+		server.Close()
+
+		setter := newTestWebhookProvider(t, addr+"/set?token="+secret, nil)
+
+		_, err := setter.SetRecords(t.Context(), "example.com", webhookTestRecords())
+		requireNoSecret(t, err)
+		require.ErrorContains(t, err, addr+"/set", "the redacted URL still says where the call went")
+	})
+
+	t.Run("refused redirect", func(t *testing.T) {
+		t.Parallel()
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/elsewhere?token="+secret, http.StatusFound)
+		}))
+		defer server.Close()
+
+		setter := newTestWebhookProvider(t, server.URL+"/set?token="+secret, nil)
+
+		_, err := setter.SetRecords(t.Context(), "example.com", webhookTestRecords())
+		requireNoSecret(t, err)
+	})
+}
