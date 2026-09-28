@@ -162,13 +162,14 @@ func (m *dnsCertificateManager) setDNS(
 	ctx context.Context,
 	node types.NodeView,
 	baseDomain string,
+	extraRecords []tailcfg.DNSRecord,
 	req tailcfg.SetDNSRequest,
 ) error {
 	if m == nil {
 		return errDNSCertProviderUnset
 	}
 
-	if err := validateSetDNSRequest(node, baseDomain, req); err != nil {
+	if err := validateSetDNSRequest(node, baseDomain, extraRecords, req); err != nil {
 		return err
 	}
 
@@ -545,10 +546,12 @@ func isSetDNSRequestError(err error) bool {
 }
 
 // validateSetDNSRequest restricts a SetDNS request to the single record a
-// node may legitimately need: the ACME DNS-01 TXT record for its own FQDN.
+// node may legitimately need: the ACME DNS-01 TXT record for its own FQDN,
+// and only while that FQDN does not collide with a dns.extra_records name.
 func validateSetDNSRequest(
 	node types.NodeView,
 	baseDomain string,
+	extraRecords []tailcfg.DNSRecord,
 	req tailcfg.SetDNSRequest,
 ) error {
 	if req.Type != "TXT" {
@@ -571,6 +574,13 @@ func validateSetDNSRequest(
 	got, ok := parseDNSName(req.Name)
 	if !ok || got != want {
 		return fmt.Errorf("%w: got %q, want %q", errDNSCertRecordName, req.Name, want)
+	}
+
+	if types.GivenNameShadowsExtraRecord(node.GivenName(), baseDomain, extraRecords) {
+		return fmt.Errorf(
+			"%w: node name %q collides with a DNS extra record",
+			errDNSCertRecordName, node.GivenName(),
+		)
 	}
 
 	return nil

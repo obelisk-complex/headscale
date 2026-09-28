@@ -406,6 +406,7 @@ func (h *Headscale) scheduledTasks(ctx context.Context) {
 			}
 
 			h.cfg.SetExtraRecords(records)
+			h.state.RefreshReservedGivenNames()
 
 			h.Change(change.ExtraRecords())
 
@@ -600,6 +601,7 @@ func (h *Headscale) Serve() error {
 		}
 
 		h.cfg.SetExtraRecords(h.extraRecordMan.Records())
+		h.state.RefreshReservedGivenNames()
 
 		go h.extraRecordMan.Run()
 		defer h.extraRecordMan.Close()

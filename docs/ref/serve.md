@@ -41,12 +41,12 @@ publish ACME DNS-01 TXT challenge records for the node.
 ```yaml
 dns:
   magic_dns: true
-  base_domain: example.com
+  base_domain: ts.example.com
 
   certificates:
     enabled: true
     provider: "provider-name"
-    zone: "example.com"
+    zone: "ts.example.com"
     ttl: 2m
     propagation_check: true
     propagation_timeout: 90s
@@ -64,6 +64,22 @@ dns:
 
 `zone` defaults to `dns.base_domain` when empty, and must contain
 `dns.base_domain`.
+
+!!! warning "Use a dedicated subdomain for `base_domain`"
+
+    Every label under `dns.base_domain` is certifiable by any node that can
+    register or rename itself to it. Node names come from the client's
+    hostname, so a node can become `www.<base_domain>` with
+    `tailscale set --hostname=www`, obtain a publicly trusted certificate for
+    that name, and MagicDNS already routes the name to the node inside the
+    tailnet. Never point `dns.base_domain` at a zone or apex you also use for
+    real hostnames. Use a subdomain that serves nothing else, such as
+    `ts.example.com`, delegated to its own zone (see
+    [RFC 2136 provider](#rfc-2136-provider)).
+
+    Headscale refuses node names that collide with a `dns.extra_records` entry
+    and never offers such a node a certificate, but it cannot know about
+    hostnames that exist only in your public DNS.
 
 `provider_config` usually carries API credentials. Rather than writing them
 into the configuration file, give any key as:
@@ -280,6 +296,10 @@ application/json; charset=utf-8`:
 
 - Nodes can only publish `TXT` records.
 - Nodes can only publish `_acme-challenge.<their-node-fqdn>`.
+- A node cannot take a name used by a `dns.extra_records` entry (registration
+  and hostname changes pick the next free `<name>-N`, admin renames are
+  refused), and a node that already holds one gets no `CertDomains` and
+  cannot publish challenges for it.
 - The Noise machine key must match the node key in the request.
 - Nodes can only publish a value shaped like an ACME DNS-01 digest (43
   base64url characters), and expired nodes cannot publish at all.

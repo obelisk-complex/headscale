@@ -77,7 +77,7 @@ func TestDNSCertificateManagerSetDNS(t *testing.T) {
 		Value:   testACMEValue("challenge"),
 	}
 
-	require.NoError(t, manager.setDNS(t.Context(), testCertNode(), "example.com", req))
+	require.NoError(t, manager.setDNS(t.Context(), testCertNode(), "example.com", nil, req))
 	require.Equal(t, "example.com", setter.zone)
 	require.Len(t, setter.records, 1)
 
@@ -104,10 +104,10 @@ func TestDNSCertificateManagerKeepsConcurrentTXTValues(t *testing.T) {
 		Type:    "TXT",
 		Value:   testACMEValue("token-1"),
 	}
-	require.NoError(t, manager.setDNS(t.Context(), node, "example.com", req))
+	require.NoError(t, manager.setDNS(t.Context(), node, "example.com", nil, req))
 
 	req.Value = testACMEValue("token-2")
-	require.NoError(t, manager.setDNS(t.Context(), node, "example.com", req))
+	require.NoError(t, manager.setDNS(t.Context(), node, "example.com", nil, req))
 
 	require.Len(t, setter.records, 2)
 }
@@ -170,7 +170,7 @@ func TestValidateSetDNSRequest(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			err := validateSetDNSRequest(node, "example.com", tailcfg.SetDNSRequest{
+			err := validateSetDNSRequest(node, "example.com", nil, tailcfg.SetDNSRequest{
 				NodeKey: node.NodeKey(),
 				Name:    tt.reqName,
 				Type:    tt.reqType,
@@ -188,6 +188,33 @@ func TestValidateSetDNSRequest(t *testing.T) {
 	}
 }
 
+// TestValidateSetDNSRequestRefusesExtraRecordCollision checks that a node
+// named after a dns.extra_records entry cannot publish a challenge for it.
+func TestValidateSetDNSRequestRefusesExtraRecordCollision(t *testing.T) {
+	t.Parallel()
+
+	node := (&types.Node{ID: 1, GivenName: "www", NodeKey: key.NewNode().Public()}).View()
+	req := tailcfg.SetDNSRequest{
+		NodeKey: node.NodeKey(),
+		Name:    "_acme-challenge.www.example.com",
+		Type:    "TXT",
+		Value:   testACMEValue("challenge"),
+	}
+
+	for _, record := range []string{"www.example.com", "WWW.Example.com.", "api.www.example.com"} {
+		err := validateSetDNSRequest(node, "example.com", []tailcfg.DNSRecord{
+			{Name: record, Type: "A", Value: "192.0.2.1"},
+		}, req)
+		require.ErrorIs(t, err, errDNSCertRecordName, "record %q", record)
+		require.True(t, isSetDNSRequestError(err))
+	}
+
+	require.NoError(t, validateSetDNSRequest(node, "example.com", []tailcfg.DNSRecord{
+		{Name: "www.example.org", Type: "A", Value: "192.0.2.1"},
+		{Name: "example.com", Type: "A", Value: "192.0.2.1"},
+	}, req))
+}
+
 func TestDNSCertificateManagerWritesCanonicalName(t *testing.T) {
 	t.Parallel()
 
@@ -197,7 +224,7 @@ func TestDNSCertificateManagerWritesCanonicalName(t *testing.T) {
 	}, setter)
 	node := testCertNode()
 
-	require.NoError(t, manager.setDNS(t.Context(), node, "example.com", tailcfg.SetDNSRequest{
+	require.NoError(t, manager.setDNS(t.Context(), node, "example.com", nil, tailcfg.SetDNSRequest{
 		NodeKey: node.NodeKey(),
 		Name:    "_ACME-Challenge.NODE1.example.com.",
 		Type:    "TXT",
@@ -218,7 +245,7 @@ func TestDNSCertificateManagerRejectsNameOutsideZone(t *testing.T) {
 	}, setter)
 	node := testCertNode()
 
-	err := manager.setDNS(t.Context(), node, "example.com", tailcfg.SetDNSRequest{
+	err := manager.setDNS(t.Context(), node, "example.com", nil, tailcfg.SetDNSRequest{
 		NodeKey: node.NodeKey(),
 		Name:    "_acme-challenge.node1.example.com",
 		Type:    "TXT",
@@ -344,7 +371,7 @@ func TestDNSPropagationWaitsForEveryAuthoritativeServer(t *testing.T) {
 	manager, _ := testPropagationManager(resolver, time.Minute)
 	node := testCertNode()
 
-	require.NoError(t, manager.setDNS(t.Context(), node, "example.com", testChallengeRequest(node, value)))
+	require.NoError(t, manager.setDNS(t.Context(), node, "example.com", nil, testChallengeRequest(node, value)))
 
 	require.Equal(t, 1, resolver.queryCount("192.0.2.1:53"), "confirmed server is not polled again")
 	require.Equal(t, 4, resolver.queryCount("192.0.2.2:53"), "lagging server is polled until it serves the value")
@@ -372,7 +399,7 @@ func TestDNSPropagationFindsDelegatedZoneCut(t *testing.T) {
 	manager, _ := testPropagationManager(resolver, time.Minute)
 	node := testCertNode()
 
-	require.NoError(t, manager.setDNS(t.Context(), node, "example.com", testChallengeRequest(node, value)))
+	require.NoError(t, manager.setDNS(t.Context(), node, "example.com", nil, testChallengeRequest(node, value)))
 	require.Zero(t, resolver.queryCount("192.0.2.1:53"), "parent zone servers are not authoritative")
 }
 
@@ -393,7 +420,7 @@ func TestDNSPropagationToleratesUnreachableAddress(t *testing.T) {
 	manager, _ := testPropagationManager(resolver, time.Minute)
 	node := testCertNode()
 
-	require.NoError(t, manager.setDNS(t.Context(), node, "example.com", testChallengeRequest(node, value)))
+	require.NoError(t, manager.setDNS(t.Context(), node, "example.com", nil, testChallengeRequest(node, value)))
 }
 
 func TestDNSPropagationTimesOut(t *testing.T) {
@@ -434,7 +461,7 @@ func TestDNSPropagationTimesOut(t *testing.T) {
 			node := testCertNode()
 
 			err := manager.setDNS(
-				t.Context(), node, "example.com",
+				t.Context(), node, "example.com", nil,
 				testChallengeRequest(node, testACMEValue("challenge")),
 			)
 			require.ErrorIs(t, err, errDNSCertPropagation)
@@ -453,7 +480,7 @@ func TestDNSPropagationRespectsRequestContext(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	err := manager.setDNS(ctx, node, "example.com", testChallengeRequest(node, testACMEValue("challenge")))
+	err := manager.setDNS(ctx, node, "example.com", nil, testChallengeRequest(node, testACMEValue("challenge")))
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	require.Less(t, time.Since(start), 5*time.Second)
 }
@@ -485,14 +512,14 @@ func TestDNSPropagationDoesNotBlockOtherNodes(t *testing.T) {
 	slowDone := make(chan error, 1)
 
 	go func() {
-		slowDone <- manager.setDNS(ctx, slowNode, "example.com", testChallengeRequest(slowNode, slowValue))
+		slowDone <- manager.setDNS(ctx, slowNode, "example.com", nil, testChallengeRequest(slowNode, slowValue))
 	}()
 
 	require.Eventually(t, func() bool {
 		return resolver.queryCount("192.0.2.1:53") > 0
 	}, 5*time.Second, time.Millisecond, "slow node is polling")
 
-	require.NoError(t, manager.setDNS(t.Context(), fastNode, "example.com", tailcfg.SetDNSRequest{
+	require.NoError(t, manager.setDNS(t.Context(), fastNode, "example.com", nil, tailcfg.SetDNSRequest{
 		NodeKey: fastNode.NodeKey(),
 		Name:    "_acme-challenge.node2.example.com",
 		Type:    "TXT",
@@ -515,7 +542,7 @@ func TestDNSPropagationWaitIsMinimum(t *testing.T) {
 
 	node := testCertNode()
 	start := time.Now()
-	require.NoError(t, manager.setDNS(t.Context(), node, "example.com", testChallengeRequest(node, testACMEValue("challenge"))))
+	require.NoError(t, manager.setDNS(t.Context(), node, "example.com", nil, testChallengeRequest(node, testACMEValue("challenge"))))
 	require.GreaterOrEqual(t, time.Since(start), 50*time.Millisecond)
 }
 
@@ -669,7 +696,7 @@ func setTestChallenge(t *testing.T, m *dnsCertificateManager, value string) {
 	t.Helper()
 
 	node := testCertNode()
-	require.NoError(t, m.setDNS(t.Context(), node, "example.com", testChallengeRequest(node, value)))
+	require.NoError(t, m.setDNS(t.Context(), node, "example.com", nil, testChallengeRequest(node, value)))
 }
 
 // expireValue backdates value so the next cleanup treats it as expired.
@@ -699,7 +726,7 @@ func TestDNSCertificateManagerMergesRRset(t *testing.T) {
 	store.setFail(true)
 
 	node := testCertNode()
-	require.Error(t, manager.setDNS(t.Context(), node, "example.com", testChallengeRequest(node, v3)))
+	require.Error(t, manager.setDNS(t.Context(), node, "example.com", nil, testChallengeRequest(node, v3)))
 	store.setFail(false)
 
 	v4 := testACMEValue("4")

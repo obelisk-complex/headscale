@@ -319,6 +319,10 @@ dns:
   # and accepts ACME DNS-01 TXT updates from authenticated nodes on
   # /machine/set-dns. The TXT records are published through a registered libdns
   # provider; Headscale does not run an authoritative DNS server for this.
+  #
+  # Any node can obtain a certificate for any name under base_domain it can
+  # rename itself to. Use a dedicated subdomain (e.g. ts.example.com) that
+  # serves no other hostnames. See docs/ref/serve.md.
   certificates:
     enabled: false
     # Name of a registered libdns provider factory.

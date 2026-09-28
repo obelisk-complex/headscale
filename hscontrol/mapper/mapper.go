@@ -148,7 +148,14 @@ func generateDNSConfig(
 	}
 
 	if cfg.DNSConfig.Certificates.Enabled {
-		if fqdn, err := node.GetFQDN(cfg.BaseDomain); err == nil {
+		// A node whose name collides with an extra record would otherwise
+		// be offered a certificate for a name it does not own. Renames are
+		// already refused; this also covers nodes that held the name before
+		// the record existed.
+		fqdn, err := node.GetFQDN(cfg.BaseDomain)
+		if err == nil && !types.GivenNameShadowsExtraRecord(
+			node.GivenName(), cfg.BaseDomain, dnsConfig.ExtraRecords,
+		) {
 			dnsConfig.CertDomains = []string{strings.TrimSuffix(fqdn, ".")}
 		}
 	}

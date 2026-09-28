@@ -1983,6 +1983,77 @@ func (c *Config) SetExtraRecords(records []tailcfg.DNSRecord) {
 	}
 }
 
+// ExtraRecords returns a copy of the extra DNS records currently served to
+// clients. Safe for concurrent use with [Config.SetExtraRecords].
+func (c *Config) ExtraRecords() []tailcfg.DNSRecord {
+	tailcfgDNSMu.RLock()
+	defer tailcfgDNSMu.RUnlock()
+
+	if c.TailcfgDNSConfig == nil {
+		return nil
+	}
+
+	return slices.Clone(c.TailcfgDNSConfig.ExtraRecords)
+}
+
+// ExtraRecordGivenName returns the node label an extra record's name
+// occupies under baseDomain: for "<...>.<label>.<baseDomain>" it returns
+// label. A node holding that label has the FQDN "<label>.<baseDomain>",
+// shadows the record in MagicDNS, and with DNS certificates enabled could
+// obtain a certificate for the record's name (the wildcard tailscaled
+// requests covers one level below the node's FQDN). ok is false when the
+// record is not below baseDomain.
+func ExtraRecordGivenName(recordName, baseDomain string) (string, bool) {
+	name := strings.ToLower(strings.TrimSuffix(recordName, "."))
+	base := strings.ToLower(strings.TrimSuffix(baseDomain, "."))
+
+	if base == "" {
+		return "", false
+	}
+
+	rest, ok := strings.CutSuffix(name, "."+base)
+	if !ok || rest == "" {
+		return "", false
+	}
+
+	if i := strings.LastIndexByte(rest, '.'); i >= 0 {
+		rest = rest[i+1:]
+	}
+
+	return rest, rest != ""
+}
+
+// ExtraRecordGivenNames returns every node label occupied by records under
+// baseDomain, see [ExtraRecordGivenName].
+func ExtraRecordGivenNames(records []tailcfg.DNSRecord, baseDomain string) map[string]struct{} {
+	names := make(map[string]struct{})
+
+	for _, record := range records {
+		if label, ok := ExtraRecordGivenName(record.Name, baseDomain); ok {
+			names[label] = struct{}{}
+		}
+	}
+
+	return names
+}
+
+// GivenNameShadowsExtraRecord reports whether a node holding givenName
+// would collide with any of records under baseDomain.
+func GivenNameShadowsExtraRecord(
+	givenName, baseDomain string,
+	records []tailcfg.DNSRecord,
+) bool {
+	givenName = strings.ToLower(givenName)
+
+	for _, record := range records {
+		if label, ok := ExtraRecordGivenName(record.Name, baseDomain); ok && label == givenName {
+			return true
+		}
+	}
+
+	return false
+}
+
 // lowercaseRecordNames normalizes DNS record names to lowercase, as DNS names
 // are case-insensitive and clients match extra records by exact name.
 func lowercaseRecordNames(records []tailcfg.DNSRecord) []tailcfg.DNSRecord {

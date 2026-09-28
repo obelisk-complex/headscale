@@ -294,6 +294,8 @@ func NewState(cfg *types.Config) (*State, error) {
 		registerLocks: xsync.NewMap[key.MachinePublic, *sync.Mutex](),
 	}
 
+	s.RefreshReservedGivenNames()
+
 	// Surface nodes whose stored data would break map generation (e.g. an
 	// invalid given name from a legacy row) so an operator can fix them. This
 	// only logs; it never mutates a node's stored name at boot.
@@ -1055,6 +1057,25 @@ func (s *State) SetApprovedRoutes(nodeID types.NodeID, routes []netip.Prefix) (t
 	return nodeView, c, nil
 }
 
+// RefreshReservedGivenNames recomputes the given names that
+// dns.extra_records occupy under base_domain and stops nodes from taking
+// them. Call it whenever the extra records change. Nodes that already hold a
+// newly reserved name are logged; the map and certificate paths refuse to
+// hand them a certificate for it.
+func (s *State) RefreshReservedGivenNames() {
+	reserved := types.ExtraRecordGivenNames(s.cfg.ExtraRecords(), s.cfg.BaseDomain)
+	s.nodeStore.SetReservedGivenNames(reserved)
+
+	for _, node := range s.nodeStore.ListNodes().All() {
+		if _, ok := reserved[node.GivenName()]; ok {
+			log.Warn().
+				Uint64(zf.NodeID, node.ID().Uint64()).
+				Str("node.given_name", node.GivenName()).
+				Msg("node name collides with a DNS extra record; rename the node")
+		}
+	}
+}
+
 // RenameNode changes the display name of a node. The admin supplies
 // the exact DNS label they want; malformed input is rejected (no
 // auto-sanitisation) and collisions error out rather than silently
@@ -1071,6 +1092,8 @@ func (s *State) RenameNode(nodeID types.NodeID, newName string) (types.NodeView,
 	view, err := s.nodeStore.SetGivenName(nodeID, newName)
 	if err != nil {
 		switch {
+		case errors.Is(err, ErrGivenNameReserved):
+			return types.NodeView{}, change.Change{}, fmt.Errorf("%w: %s", ErrGivenNameReserved, newName)
 		case errors.Is(err, ErrGivenNameTaken):
 			return types.NodeView{}, change.Change{}, fmt.Errorf("%w: %s", ErrNodeNameNotUnique, newName)
 		case errors.Is(err, ErrNodeNotFound):

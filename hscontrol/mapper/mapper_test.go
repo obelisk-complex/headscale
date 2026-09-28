@@ -240,6 +240,34 @@ func TestGenerateDNSConfigCertDomains(t *testing.T) {
 		got := generateDNSConfig(mkConfig(false), node, nil)
 		require.Empty(t, got.CertDomains)
 	})
+
+	// A node whose name collides with an extra record must not be offered
+	// a certificate for it, even if it held the name before the record.
+	for _, record := range []string{"node1.tailnet.example.com", "api.node1.tailnet.example.com"} {
+		t.Run("extra-record-"+record, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := mkConfig(true)
+			cfg.TailcfgDNSConfig.ExtraRecords = []tailcfg.DNSRecord{
+				{Name: record, Type: "A", Value: "192.0.2.1"},
+			}
+
+			got := generateDNSConfig(cfg, node, nil)
+			require.Empty(t, got.CertDomains)
+		})
+	}
+
+	t.Run("unrelated-extra-record", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := mkConfig(true)
+		cfg.TailcfgDNSConfig.ExtraRecords = []tailcfg.DNSRecord{
+			{Name: "node1.example.com", Type: "A", Value: "192.0.2.1"},
+		}
+
+		got := generateDNSConfig(cfg, node, nil)
+		require.Equal(t, []string{"node1.tailnet.example.com"}, got.CertDomains)
+	})
 }
 
 // TestBuildFromChangeFiltersPeerPatchesByVisibility proves that incremental

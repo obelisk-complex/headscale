@@ -31,6 +31,9 @@ const fallbackGivenName = "node"
 var (
 	ErrGivenNameTaken   = errors.New("given name already in use by another node")
 	ErrGivenNameInvalid = errors.New("given name is not a valid DNS label")
+	// ErrGivenNameReserved wraps [ErrGivenNameTaken]: the name is held by a
+	// dns.extra_records entry rather than by another node.
+	ErrGivenNameReserved = fmt.Errorf("%w: reserved by a DNS extra record", ErrGivenNameTaken)
 )
 
 const (
@@ -123,6 +126,27 @@ type NodeStore struct {
 
 	batchSize    int
 	batchTimeout time.Duration
+
+	// reservedNames holds the given names no node may take because a
+	// dns.extra_records entry lives at or below "<name>.<base_domain>".
+	// Read once per batch by the writer goroutine.
+	reservedNames atomic.Pointer[map[string]struct{}]
+}
+
+// SetReservedGivenNames replaces the set of given names that nodes may not
+// hold. Later writes treat them like names held by another node: automatic
+// names are bumped, [NodeStore.SetGivenName] is refused. Nodes already
+// holding a newly reserved name keep it until their name is next written.
+func (s *NodeStore) SetReservedGivenNames(names map[string]struct{}) {
+	s.reservedNames.Store(&names)
+}
+
+func (s *NodeStore) loadReservedGivenNames() map[string]struct{} {
+	if p := s.reservedNames.Load(); p != nil {
+		return *p
+	}
+
+	return nil
 }
 
 func NewNodeStore(allNodes types.Nodes, peersFunc PeersFunc, batchSize int, batchTimeout time.Duration) *NodeStore {
@@ -476,12 +500,14 @@ func (s *NodeStore) applyBatch(batch []work) {
 	relationChanged := false
 	electionChanged := false
 
+	reserved := s.loadReservedGivenNames()
+
 	for i := range batch {
 		w := &batch[i]
 		switch w.op {
 		case put:
 			n := w.node
-			n.GivenName = resolveGivenName(nodes, n.ID, n.GivenName)
+			n.GivenName = resolveGivenName(nodes, reserved, n.ID, n.GivenName)
 
 			nodes[w.nodeID] = n
 			if w.nodeResult != nil {
@@ -502,7 +528,7 @@ func (s *NodeStore) applyBatch(batch []work) {
 				fn(&n)
 
 				if n.GivenName != oldGivenName {
-					n.GivenName = resolveGivenName(nodes, n.ID, n.GivenName)
+					n.GivenName = resolveGivenName(nodes, reserved, n.ID, n.GivenName)
 				}
 
 				nodes[id] = n
@@ -531,6 +557,13 @@ func (s *NodeStore) applyBatch(batch []work) {
 
 			if dnsname.ValidLabel(w.name) != nil {
 				setErrResults[w] = ErrGivenNameInvalid
+				nodeResultRequests[w.nodeID] = append(nodeResultRequests[w.nodeID], w)
+
+				continue
+			}
+
+			if _, isReserved := reserved[w.name]; isReserved {
+				setErrResults[w] = ErrGivenNameReserved
 				nodeResultRequests[w.nodeID] = append(nodeResultRequests[w.nodeID], w)
 
 				continue
@@ -621,18 +654,25 @@ func (s *NodeStore) applyBatch(batch []work) {
 // by self, based on the caller-supplied base label. If base is empty
 // it falls back to [fallbackGivenName] ("node"). The label's own holder
 // (self) is excluded from the collision scan so an idempotent write
-// keeps the current label.
+// keeps the current label. Names in reserved count as taken.
 //
 // On collision the label is bumped as base, base-1, base-2, …, first
 // unused wins. Must be called from the [NodeStore] writer goroutine
 // (inside [NodeStore.applyBatch]) so the nodes map reflects all earlier
 // ops in the batch and no other writer can interleave.
-func resolveGivenName(nodes map[types.NodeID]types.Node, self types.NodeID, base string) string {
+func resolveGivenName(
+	nodes map[types.NodeID]types.Node,
+	reserved map[string]struct{},
+	self types.NodeID,
+	base string,
+) string {
 	if base == "" {
 		base = fallbackGivenName
 	}
 
-	taken := make(map[string]struct{}, len(nodes))
+	taken := make(map[string]struct{}, len(nodes)+len(reserved))
+	maps.Copy(taken, reserved)
+
 	for id, n := range nodes {
 		if id == self {
 			continue

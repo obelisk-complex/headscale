@@ -213,3 +213,34 @@ func TestSetGivenNameIdempotent(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "laptop", view.GivenName())
 }
+
+// TestReservedGivenNames covers names held by dns.extra_records: a node
+// must never take one, whether it registers with it, renames itself to it
+// through its hostname, or an admin renames it. Holding such a name would
+// let the node shadow the record and obtain a certificate for its name.
+func TestReservedGivenNames(t *testing.T) {
+	store := NewNodeStore(nil, allowAllPeersFunc, TestBatchSize, TestBatchTimeout)
+	store.SetReservedGivenNames(map[string]struct{}{"www": {}})
+
+	store.Start()
+	defer store.Stop()
+
+	registered := store.PutNode(createTestNode(1, 1, "alice", "www"))
+	require.Equal(t, "www-1", registered.GivenName(), "registration bumps past a reserved name")
+
+	store.PutNode(createTestNode(2, 1, "alice", "laptop"))
+
+	renamed, ok := store.UpdateNode(2, func(n *types.Node) { n.GivenName = "www" })
+	require.True(t, ok)
+	require.Equal(t, "www-2", renamed.GivenName(), "hostname-driven rename bumps past a reserved name")
+
+	_, err := store.SetGivenName(2, "www")
+	require.ErrorIs(t, err, ErrGivenNameReserved)
+	require.ErrorIs(t, err, ErrGivenNameTaken, "reserved names map to the existing taken-name API errors")
+
+	store.SetReservedGivenNames(nil)
+
+	view, err := store.SetGivenName(2, "www")
+	require.NoError(t, err, "a released name can be taken again")
+	require.Equal(t, "www", view.GivenName())
+}

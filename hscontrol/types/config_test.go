@@ -1267,3 +1267,27 @@ func TestExtraRecordsAreLowercased(t *testing.T) {
 		t.Errorf("SetExtraRecords mismatch (-want +got):\n%s", diff)
 	}
 }
+
+func TestExtraRecordGivenName(t *testing.T) {
+	tests := []struct {
+		record, base string
+		want         string
+		ok           bool
+	}{
+		{"www.example.com", "example.com", "www", true},
+		{"WWW.Example.COM.", "example.com.", "www", true},
+		{"api.www.example.com", "example.com", "www", true},
+		{"example.com", "example.com", "", false},
+		{"www.example.org", "example.com", "", false},
+		{"wwwexample.com", "example.com", "", false},
+		{"www.example.com", "", "", false},
+	}
+
+	for _, tt := range tests {
+		got, ok := ExtraRecordGivenName(tt.record, tt.base)
+		if got != tt.want || ok != tt.ok {
+			t.Errorf("ExtraRecordGivenName(%q, %q) = %q, %v; want %q, %v",
+				tt.record, tt.base, got, ok, tt.want, tt.ok)
+		}
+	}
+}

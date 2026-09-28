@@ -874,6 +874,7 @@ func (ns *noiseServer) SetDNSHandler(writer http.ResponseWriter, req *http.Reque
 		req.Context(),
 		nv,
 		ns.headscale.cfg.BaseDomain,
+		ns.headscale.cfg.ExtraRecords(),
 		dnsReq,
 	)
 	if err != nil {
