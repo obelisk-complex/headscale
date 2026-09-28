@@ -16,12 +16,17 @@ import (
 	"net"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
-const webhookMaxBodyBytes = 64 * 1024
+const (
+	webhookMaxBodyBytes = 64 * 1024
+	// webhookMaxSkew is the freshness window docs/ref/serve.md recommends.
+	webhookMaxSkew = 5 * time.Minute
+)
 
 // WebhookRecord is one TXT record in a Headscale webhook request.
 type WebhookRecord struct {
@@ -73,7 +78,7 @@ type WebhookAdapter struct {
 
 // NewWebhookAdapter listens on a free port on all interfaces. Requests
 // must carry authToken as a bearer token and, when hmacSecret is set, a
-// valid X-Headscale-Signature.
+// valid X-Headscale-Signature over a fresh X-Headscale-Timestamp.
 func NewWebhookAdapter(challTestSrvURL, authToken, hmacSecret string) (*WebhookAdapter, error) {
 	listener, err := net.Listen("tcp", ":0") //nolint:gosec // must be reachable from the Headscale container
 	if err != nil {
@@ -185,7 +190,9 @@ func (a *WebhookAdapter) handle(action string) http.HandlerFunc {
 	}
 }
 
-// authorised checks the bearer token and the HMAC signature of body.
+// authorised checks the bearer token and, when an HMAC secret is set, the
+// signature over the X-Headscale-Timestamp value and body, and that the
+// timestamp is within webhookMaxSkew of now.
 func (a *WebhookAdapter) authorised(r *http.Request, body []byte) bool {
 	if a.authToken != "" {
 		got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
@@ -205,7 +212,20 @@ func (a *WebhookAdapter) authorised(r *http.Request, body []byte) bool {
 			return false
 		}
 
+		timestamp := r.Header.Get("X-Headscale-Timestamp")
+
+		sent, err := strconv.ParseInt(timestamp, 10, 64)
+		if err != nil {
+			return false
+		}
+
+		// Refuse replays of a captured request outside the freshness window.
+		if age := time.Since(time.Unix(sent, 0)); age > webhookMaxSkew || age < -webhookMaxSkew {
+			return false
+		}
+
 		mac := hmac.New(sha256.New, []byte(a.hmacSecret))
+		mac.Write([]byte(timestamp + "."))
 		mac.Write(body)
 
 		if !hmac.Equal(sig, mac.Sum(nil)) {

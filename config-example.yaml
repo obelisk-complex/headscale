@@ -381,7 +381,7 @@ dns:
     #   set_url: https://dns-shim.internal/set
     #   delete_url: https://dns-shim.internal/delete  # optional
     #   auth_token_path: /run/secrets/dns_webhook_token  # sent as "Authorization: Bearer <token>"
-    #   hmac_secret_env: DNS_WEBHOOK_HMAC_SECRET         # signs the body, header "X-Headscale-Signature"
+    #   hmac_secret_env: DNS_WEBHOOK_HMAC_SECRET         # signs timestamp + body, header "X-Headscale-Signature"
     #   timeout: 10s
     #   max_retries: "2"        # extra attempts on network errors, 429 and 5xx
     #   insecure_http: "false"  # set "true" to allow a plain http:// URL (local/test only)

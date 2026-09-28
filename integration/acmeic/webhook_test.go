@@ -9,8 +9,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -102,16 +104,23 @@ func post(t *testing.T, a *WebhookAdapter, action string, values ...string) int 
 	body, err := json.Marshal(req)
 	require.NoError(t, err)
 
-	return postRaw(t, a, "/"+action, body, "Bearer "+testToken, sign(body, testSecret))
+	ts := now()
+
+	return postRaw(t, a, "/"+action, body, "Bearer "+testToken, ts, sign(ts, body, testSecret))
 }
 
-func postRaw(t *testing.T, a *WebhookAdapter, path string, body []byte, auth, sig string) int {
+func now() string {
+	return strconv.FormatInt(time.Now().Unix(), 10)
+}
+
+func postRaw(t *testing.T, a *WebhookAdapter, path string, body []byte, auth, ts, sig string) int {
 	t.Helper()
 
 	url := fmt.Sprintf("http://127.0.0.1:%d%s", a.Port(), path)
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, url, bytes.NewReader(body))
 	require.NoError(t, err)
 	req.Header.Set("Authorization", auth)
+	req.Header.Set("X-Headscale-Timestamp", ts)
 	req.Header.Set("X-Headscale-Signature", sig)
 
 	resp, err := http.DefaultClient.Do(req)
@@ -121,8 +130,9 @@ func postRaw(t *testing.T, a *WebhookAdapter, path string, body []byte, auth, si
 	return resp.StatusCode
 }
 
-func sign(body []byte, secret string) string {
+func sign(ts string, body []byte, secret string) string {
 	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(ts + "."))
 	mac.Write(body)
 
 	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
@@ -215,25 +225,33 @@ func TestWebhookAdapterRejects(t *testing.T) {
 	})
 	require.NoError(t, err)
 
+	ts := now()
+	stale := strconv.FormatInt(time.Now().Add(-10*time.Minute).Unix(), 10)
+	bearer := "Bearer " + testToken
+
 	tests := []struct {
 		name string
 		path string
 		body []byte
 		auth string
+		ts   string
 		sig  string
 		want int
 	}{
-		{"wrong token", "/set", valid, "Bearer nope", sign(valid, testSecret), http.StatusUnauthorized},
-		{"no token", "/set", valid, "", sign(valid, testSecret), http.StatusUnauthorized},
-		{"wrong signature", "/set", valid, "Bearer " + testToken, sign(valid, "nope"), http.StatusUnauthorized},
-		{"no signature", "/set", valid, "Bearer " + testToken, "", http.StatusUnauthorized},
-		{"action mismatch", "/delete", valid, "Bearer " + testToken, sign(valid, testSecret), http.StatusBadRequest},
-		{"unknown path", "/other", valid, "Bearer " + testToken, sign(valid, testSecret), http.StatusNotFound},
+		{"wrong token", "/set", valid, "Bearer nope", ts, sign(ts, valid, testSecret), http.StatusUnauthorized},
+		{"no token", "/set", valid, "", ts, sign(ts, valid, testSecret), http.StatusUnauthorized},
+		{"wrong signature", "/set", valid, bearer, ts, sign(ts, valid, "nope"), http.StatusUnauthorized},
+		{"no signature", "/set", valid, bearer, ts, "", http.StatusUnauthorized},
+		{"signature over other timestamp", "/set", valid, bearer, ts, sign(stale, valid, testSecret), http.StatusUnauthorized},
+		{"stale timestamp", "/set", valid, bearer, stale, sign(stale, valid, testSecret), http.StatusUnauthorized},
+		{"no timestamp", "/set", valid, bearer, "", sign("", valid, testSecret), http.StatusUnauthorized},
+		{"action mismatch", "/delete", valid, bearer, ts, sign(ts, valid, testSecret), http.StatusBadRequest},
+		{"unknown path", "/other", valid, bearer, ts, sign(ts, valid, testSecret), http.StatusNotFound},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, postRaw(t, a, tt.path, tt.body, tt.auth, tt.sig))
+			assert.Equal(t, tt.want, postRaw(t, a, tt.path, tt.body, tt.auth, tt.ts, tt.sig))
 		})
 	}
 
@@ -252,8 +270,9 @@ func TestWebhookAdapterZoneApex(t *testing.T) {
 	})
 	require.NoError(t, err)
 
+	ts := now()
 	require.Equal(t, http.StatusNoContent,
-		postRaw(t, a, "/set", body, "Bearer "+testToken, sign(body, testSecret)))
+		postRaw(t, a, "/set", body, "Bearer "+testToken, ts, sign(ts, body, testSecret)))
 
 	txt, _ := fake.state("example.com.")
 	assert.Equal(t, []string{"apex"}, txt)

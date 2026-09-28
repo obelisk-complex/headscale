@@ -81,7 +81,7 @@ func newWebhookDNSProvider(raw map[string]string) (libdns.RecordSetter, error) {
 		CheckRedirect: webhookCheckRedirect,
 	}
 
-	provider := &webhookProvider{cfg: cfg, client: client}
+	provider := &webhookProvider{cfg: cfg, client: client, now: time.Now}
 
 	// DeleteRecords is opt-in: only expose it (so the manager's
 	// setter.(libdns.RecordDeleter) type assertion succeeds) when the
@@ -223,6 +223,7 @@ func webhookConfigInt(raw map[string]string, key string, def int) (int, error) {
 type webhookProvider struct {
 	cfg    webhookConfig
 	client *http.Client
+	now    func() time.Time
 }
 
 // errWebhookRedirect marks a redirect the webhook client refused to follow.
@@ -358,14 +359,16 @@ func (p *webhookProvider) attempt(
 
 	req.Header.Set("Content-Type", "application/json; charset=utf-8")
 
+	// Stamped per attempt, so a retry carries a fresh timestamp.
+	timestamp := strconv.FormatInt(p.now().Unix(), 10)
+	req.Header.Set(webhookTimestampHeader, timestamp)
+
 	if p.cfg.authToken != "" {
 		req.Header.Set("Authorization", "Bearer "+p.cfg.authToken)
 	}
 
 	if p.cfg.hmacSecret != "" {
-		mac := hmac.New(sha256.New, []byte(p.cfg.hmacSecret))
-		mac.Write(body)
-		req.Header.Set("X-Headscale-Signature", "sha256="+hex.EncodeToString(mac.Sum(nil)))
+		req.Header.Set(webhookSignatureHeader, webhookSignature(p.cfg.hmacSecret, timestamp, body))
 	}
 
 	resp, err := p.client.Do(req)
@@ -385,6 +388,24 @@ func (p *webhookProvider) attempt(
 	}
 
 	return nil
+}
+
+const (
+	webhookTimestampHeader = "X-Headscale-Timestamp"
+	webhookSignatureHeader = "X-Headscale-Signature"
+)
+
+// webhookSignature returns the X-Headscale-Signature value for body sent at
+// timestamp (Unix seconds, as sent in X-Headscale-Timestamp): HMAC-SHA256
+// over "<timestamp>.<body>". Binding the timestamp into the MAC lets a
+// receiver reject a captured request replayed later; see docs/ref/serve.md.
+func webhookSignature(secret, timestamp string, body []byte) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(timestamp))
+	mac.Write([]byte{'.'})
+	mac.Write(body)
+
+	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
 }
 
 // webhookStatusError is a non-2xx webhook response.

@@ -100,12 +100,13 @@ func TestWebhookAuthToken(t *testing.T) {
 func TestWebhookHMACSignature(t *testing.T) {
 	t.Parallel()
 
-	var gotSignature string
+	var gotSignature, gotTimestamp string
 
 	var gotBody []byte
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotSignature = r.Header.Get("X-Headscale-Signature")
+		gotTimestamp = r.Header.Get("X-Headscale-Timestamp")
 
 		var err error
 		gotBody, err = io.ReadAll(r.Body)
@@ -117,13 +118,73 @@ func TestWebhookHMACSignature(t *testing.T) {
 
 	setter := newTestWebhookProvider(t, server.URL, map[string]string{"hmac_secret": "shared-secret"})
 
+	before := time.Now().Unix()
 	_, err := setter.SetRecords(t.Context(), "example.com", webhookTestRecords())
 	require.NoError(t, err)
 
+	// The timestamp is the current time in Unix seconds.
+	sent, err := strconv.ParseInt(gotTimestamp, 10, 64)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, sent, before)
+	require.LessOrEqual(t, sent, time.Now().Unix())
+
+	// Computed independently of webhookSignature, as a receiver would.
 	mac := hmac.New(sha256.New, []byte("shared-secret"))
+	mac.Write([]byte(gotTimestamp + "."))
 	mac.Write(gotBody)
 	want := "sha256=" + hex.EncodeToString(mac.Sum(nil))
 	require.Equal(t, want, gotSignature)
+}
+
+func TestWebhookSignatureBindsTimestamp(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{"action":"set"}`)
+
+	require.NotEqual(t,
+		webhookSignature("shared-secret", "1700000000", body),
+		webhookSignature("shared-secret", "1700000001", body),
+		"the timestamp must be covered by the signature",
+	)
+}
+
+// TestWebhookSignatureFreshPerRequest checks that two requests with the same
+// body, sent a moment apart, carry different timestamps and signatures, so
+// a receiver enforcing a freshness window can reject a replay of either.
+func TestWebhookSignatureFreshPerRequest(t *testing.T) {
+	t.Parallel()
+
+	var (
+		signatures []string
+		timestamps []string
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		signatures = append(signatures, r.Header.Get("X-Headscale-Signature"))
+		timestamps = append(timestamps, r.Header.Get("X-Headscale-Timestamp"))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	setter := newTestWebhookProvider(t, server.URL, map[string]string{"hmac_secret": "shared-secret"})
+
+	provider, ok := setter.(*webhookProvider)
+	require.True(t, ok)
+
+	clock := time.Unix(1700000000, 0)
+	provider.now = func() time.Time { return clock }
+
+	_, err := setter.SetRecords(t.Context(), "example.com", webhookTestRecords())
+	require.NoError(t, err)
+
+	clock = clock.Add(time.Second)
+
+	_, err = setter.SetRecords(t.Context(), "example.com", webhookTestRecords())
+	require.NoError(t, err)
+
+	require.Equal(t, []string{"1700000000", "1700000001"}, timestamps)
+	require.Len(t, signatures, 2)
+	require.NotEqual(t, signatures[0], signatures[1])
 }
 
 func TestWebhookNon2xxReturnsError(t *testing.T) {

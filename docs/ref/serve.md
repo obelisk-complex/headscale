@@ -268,7 +268,7 @@ dns:
 | `set_url`       | yes      | -       | Endpoint called for every `SetRecords`.                                           |
 | `delete_url`    | no       | unset   | Endpoint called for record deletion. Unset = the provider does not implement `libdns.RecordDeleter`, matching every other optional-delete provider (see [Record cleanup](#record-cleanup)). |
 | `auth_token`    | no       | unset   | Sent as `Authorization: Bearer <auth_token>`. Give it as `auth_token_path` or `auth_token_env` to keep it out of the config file (see [Configuration](#configuration)). |
-| `hmac_secret`   | no       | unset   | Signs the raw request body with HMAC-SHA256, sent as `X-Headscale-Signature: sha256=<hex>`. Also resolvable via `_path`/`_env`. |
+| `hmac_secret`   | no       | unset   | Signs each request with HMAC-SHA256, sent as `X-Headscale-Signature: sha256=<hex>` (see [Request](#request)). Also resolvable via `_path`/`_env`. |
 | `timeout`       | no       | `10s`   | Per-HTTP-request timeout, as a Go duration.                                       |
 | `max_retries`   | no       | `2`     | Extra attempts, with exponential backoff (200ms, 400ms, 800ms, capped at 2s), on a transport error, HTTP 429, or HTTP 5xx. Any other non-2xx response is not retried. |
 | `insecure_http` | no       | `false` | Set to `"true"` to allow `set_url`/`delete_url` to use `http://` instead of `https://`. Local/test use only. |
@@ -319,6 +319,24 @@ application/json; charset=utf-8`:
   unset.
 - On `delete_url`, `records` holds only the values Headscale is removing
   (expired challenge values), not the rest of the RRset.
+
+Headers:
+
+- `X-Headscale-Timestamp`: the time the request was sent, as decimal Unix
+  seconds (for example `1700000000`). Sent on every request, and refreshed on
+  every retry.
+- `X-Headscale-Signature: sha256=<hex>`, only when `hmac_secret` is set:
+  lower-case hex HMAC-SHA256, keyed with `hmac_secret`, over the
+  `X-Headscale-Timestamp` value, a `.`, and the raw request body, byte for
+  byte: `HMAC(hmac_secret, "<timestamp>.<body>")`.
+- `Authorization: Bearer <auth_token>`, only when `auth_token` is set.
+
+A receiver that uses `hmac_secret` must recompute the signature over the
+timestamp and body exactly as received, compare it in constant time, and
+reject a request whose timestamp is more than 5 minutes away from its own
+clock. Without that freshness check a captured request can be replayed to
+re-publish an old challenge value; the bearer token is static and does not
+prevent this on its own.
 
 ### Response
 
