@@ -9,6 +9,7 @@ import (
 	"net"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1103,4 +1104,35 @@ func TestDNSCertificateManagerCleanupBackoff(t *testing.T) {
 		30 * time.Second, time.Minute, 2 * time.Minute, 4 * time.Minute,
 		8 * time.Minute, 10 * time.Minute, 10 * time.Minute,
 	}, got)
+}
+
+// TestValidateSetDNSRequestBoundsLoggedInput checks that a node sending a
+// huge Type or Name cannot have it formatted into the (logged) error in
+// full.
+func TestValidateSetDNSRequestBoundsLoggedInput(t *testing.T) {
+	t.Parallel()
+
+	node := testCertNode()
+	huge := strings.Repeat("\x00", 64*1024)
+	// %q renders each NUL as 4 bytes; the bound must hold after quoting.
+	maxLen := 4*untrustedLogLimit + 256
+
+	for _, req := range []tailcfg.SetDNSRequest{
+		{NodeKey: node.NodeKey(), Name: "_acme-challenge.node1.example.com", Type: huge, Value: testACMEValue("1")},
+		{NodeKey: node.NodeKey(), Name: huge, Type: "TXT", Value: testACMEValue("1")},
+	} {
+		err := validateSetDNSRequest(node, "example.com", nil, req)
+		require.Error(t, err)
+		require.True(t, isSetDNSRequestError(err))
+		require.Less(t, len(err.Error()), maxLen)
+		require.Contains(t, err.Error(), "...(truncated)")
+	}
+}
+
+func TestTruncateUntrusted(t *testing.T) {
+	t.Parallel()
+
+	short := strings.Repeat("a", untrustedLogLimit)
+	require.Equal(t, short, truncateUntrusted(short))
+	require.Equal(t, short+"...(truncated)", truncateUntrusted(short+"b"))
 }

@@ -42,6 +42,11 @@ const (
 	// its newest value published and a looping client cannot grow the RRset.
 	dnsCertMaxValuesPerName = 2
 
+	// untrustedLogLimit caps how many bytes of a client-supplied string are
+	// formatted into an error. Those errors are logged, and a node can send
+	// a string as large as the request body limit.
+	untrustedLogLimit = 256
+
 	// setDNSRateBurst and setDNSRateInterval bound /machine/set-dns per node:
 	// a burst of setDNSRateBurst requests, refilled at one per interval.
 	// A certificate order needs one request per name, two with a wildcard.
@@ -794,7 +799,7 @@ func validateSetDNSRequest(
 	req tailcfg.SetDNSRequest,
 ) error {
 	if req.Type != "TXT" {
-		return fmt.Errorf("%w: got %q", errDNSCertRecordType, req.Type)
+		return fmt.Errorf("%w: got %q", errDNSCertRecordType, truncateUntrusted(req.Type))
 	}
 
 	if !isACMEDNS01Value(req.Value) {
@@ -812,7 +817,7 @@ func validateSetDNSRequest(
 
 	got, ok := parseDNSName(req.Name)
 	if !ok || got != want {
-		return fmt.Errorf("%w: got %q, want %q", errDNSCertRecordName, req.Name, want)
+		return fmt.Errorf("%w: got %q, want %q", errDNSCertRecordName, truncateUntrusted(req.Name), want)
 	}
 
 	if types.GivenNameShadowsExtraRecord(node.GivenName(), baseDomain, extraRecords) {
@@ -823,6 +828,16 @@ func validateSetDNSRequest(
 	}
 
 	return nil
+}
+
+// truncateUntrusted bounds a client-supplied string before it is formatted
+// into an error or log line.
+func truncateUntrusted(s string) string {
+	if len(s) <= untrustedLogLimit {
+		return s
+	}
+
+	return s[:untrustedLogLimit] + "...(truncated)"
 }
 
 // acmeChallengeName returns the canonical DNS-01 challenge name for node.
